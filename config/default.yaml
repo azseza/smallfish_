@@ -1,0 +1,123 @@
+# ============================================================
+# BYBIT SCALPER — Master Configuration
+# ============================================================
+
+# --- Symbols ---
+symbols:
+  - "BTCUSDT"
+  - "ETHUSDT"
+
+# Tick sizes per symbol (quote currency per tick)
+tick_sizes:
+  BTCUSDT: 0.10
+  ETHUSDT: 0.01
+
+# Minimum order quantities
+min_qty:
+  BTCUSDT: 0.001
+  ETHUSDT: 0.01
+
+# Qty step (precision)
+qty_step:
+  BTCUSDT: 0.001
+  ETHUSDT: 0.01
+
+# --- Account ---
+leverage: 10
+initial_equity: 1000  # USD — updated at startup from REST
+
+# --- Risk Management ---
+max_spread: 2                        # max bid-ask spread in ticks to allow entry
+risk_per_trade: 0.005                # 0.5% equity at risk per trade
+max_risk_dollars: 5.0                # hard cap per-trade risk in USD
+max_daily_R: 10                      # max daily loss in R-multiples → kill switch
+base_stop_ticks: 3                   # default stop-loss distance
+tp_ticks_multiplier: 1.5            # TP = base_stop_ticks * this
+trail_step_ticks: 1                  # trailing stop step size
+kill_switch_slip_breaches: 3         # kill switch after N slippage breaches
+max_slippage_ticks: 2                # slippage threshold per order
+max_open_orders: 2                   # max simultaneous open orders
+cooldown_after_loss_ms: 5000         # cooldown after a losing trade
+
+# Dynamic sizing — reduce size during drawdown
+drawdown_tiers:
+  - { threshold: 0.02, multiplier: 1.0 }   # 0-2% DD: full size
+  - { threshold: 0.05, multiplier: 0.5 }   # 2-5% DD: half size
+  - { threshold: 0.10, multiplier: 0.25 }  # 5-10% DD: quarter size
+  - { threshold: 1.00, multiplier: 0.0 }   # >10% DD: stop trading
+
+# --- Entry / Exit Gates ---
+C_enter: 0.65                        # min confidence to enter
+C_trail: 0.85                        # min confidence to trail stop tighter
+C_exit: 0.40                         # exit if confidence drops below this
+deadband: 0.05                       # hysteresis to prevent whipsaws
+alpha: 5                             # sigmoid steepness for confidence mapping
+
+# --- Execution ---
+entry_timeout_ms: 600                # wait for post-only fill
+reprice_trigger_ticks: 1             # reprice if BBO moves this far
+ioc_pmin: 0.65                       # min fill prob to use IOC fallback
+max_reprice_attempts: 3              # max reprices before giving up
+
+# --- Signal Weights (w = core, v = whale lens) ---
+weights:
+  w: [0.30, 0.15, 0.20]             # OBI, PRT, UMOM
+  v: [0.12, 0.08, 0.05]             # LTB, SWEEP, ICE
+  x: [0.07, 0.03]                   # VWAP_DEV, VOL_REGIME
+
+# --- Volatility Regime ---
+vol_regime:
+  lookback_s: 60                     # seconds for realized vol
+  low_vol_threshold: 0.3             # below = mean-revert mode
+  high_vol_threshold: 1.2            # above = momentum mode
+  extreme_vol_threshold: 3.0         # above = stop trading
+
+# --- VWAP ---
+vwap:
+  lookback_trades: 500               # rolling VWAP window
+  deviation_ticks_threshold: 5       # signal fires above this deviation
+
+# --- Whale Detection ---
+whale:
+  large_trade_multiplier: 5.0        # trade size > k * median → whale
+  large_trade_min_usd: 50000         # absolute minimum for "large"
+  burst_window_ms: 2000              # window for burst detection
+  sweep_levels: 3                    # levels cleared = sweep
+  ice_refill_count: 4                # replenishments to detect iceberg
+  ice_window_ms: 5000                # window for iceberg detection
+
+# --- PRT (Pull & Replace Trap) ---
+prt:
+  cancel_window_ms: 500              # window for cancel rate
+  cancel_rate_threshold: 0.6         # activation threshold
+  mid_change_max_ticks: 2            # max mid-price move for activation
+
+# --- Latency ---
+max_latency_ms: 80                   # won't trade if latency exceeds this
+
+# --- Funding Window ---
+funding_window_minutes: 3            # avoid trading N minutes before/after funding
+
+# --- Logging ---
+log_level: "INFO"
+log_decisions: true
+log_orders: true
+log_trades: true
+snapshot_interval_s: 300             # save state snapshot every 5 min
+
+# --- WebSocket ---
+ws:
+  ping_interval_s: 20
+  ping_timeout_s: 10
+  reconnect_delay_s: 1
+  max_reconnect_delay_s: 30
+  orderbook_depth: 50                # request 50-level book
+
+# --- Adaptive Weights ---
+adaptive:
+  enabled: true
+  lookback_trades: 100               # trades to evaluate signal edge
+  min_edge: 0.0001                   # min edge to keep signal active
+  weight_floor: 0.5                  # min multiplier on base weight
+  weight_ceiling: 2.0                # max multiplier on base weight
+  update_interval_trades: 50         # re-evaluate every N trades

@@ -1,0 +1,1 @@
+timestamp,order_id,symbol,side,type,price,quantity,status,time_in_force,filled_qty,avg_fill_price

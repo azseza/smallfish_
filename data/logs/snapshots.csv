@@ -1,0 +1,2 @@
+timestamp,equity,daily_pnl,drawdown,daily_loss_R,trades,wins,losses,win_rate,vol_regime,latency_ema
+1770214090536,1000,0.0,0.0,0.0,0,0,0,0.0,normal,50.1

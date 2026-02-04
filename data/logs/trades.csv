@@ -1,0 +1,1 @@
+timestamp,symbol,side,entry_price,exit_price,quantity,pnl,pnl_R,duration_ms,slippage_entry,slippage_exit,exit_reason,mae,mfe
