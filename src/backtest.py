@@ -1,4 +1,4 @@
-"""Backtesting Engine for Bybit Scalper.
+"""Backtesting Engine for Smallfish.
 
 Downloads historical kline + trade data from Bybit public API,
 simulates the full signal pipeline, and reports projected performance.
@@ -7,6 +7,7 @@ Usage:
     python src/backtest.py --equity 50 --days 30 --symbol BTCUSDT
     python src/backtest.py --equity 50 --days 30 --multi --mode aggressive
     python src/backtest.py --equity 50 --days 30 --sweep
+    python src/backtest.py --equity 50 --days 30 --mode aggressive --chart
 """
 from __future__ import annotations
 import asyncio
@@ -726,7 +727,8 @@ class BacktestEngine:
 # ─── Main ─────────────────────────────────────────────────────────────────
 
 async def run_backtest(symbols: List[str], days: int = 30, equity: float = 50.0,
-                       profile: str = "conservative", auto_symbols: int = 0):
+                       profile: str = "conservative", auto_symbols: int = 0,
+                       show_chart: bool = False):
     # Load config
     config_path = os.path.join(os.path.dirname(__file__), "..", "config", "default.yaml")
     with open(config_path) as f:
@@ -831,6 +833,14 @@ async def run_backtest(symbols: List[str], days: int = 30, equity: float = 50.0,
 
     report = engine.report()
     print_report(report, symbols, days, equity, profile)
+
+    # Terminal charts if --chart flag
+    if show_chart:
+        from monitor.dashboard import TerminalDashboard
+        print(TerminalDashboard.render_backtest_trades(engine.trade_log))
+        print(TerminalDashboard.render_equity_curve(engine.equity_curve))
+        print(TerminalDashboard.render_signal_weights(config))
+
     return report
 
 
@@ -1006,7 +1016,7 @@ if __name__ == "__main__":
         datefmt="%H:%M:%S",
     )
 
-    parser = argparse.ArgumentParser(description="Bybit Scalper Backtest")
+    parser = argparse.ArgumentParser(description="Smallfish Backtest")
     parser.add_argument("--symbol", default="BTCUSDT", help="Trading symbol")
     parser.add_argument("--symbols", nargs="+", help="Multiple symbols: --symbols BTCUSDT ETHUSDT SOLUSDT")
     parser.add_argument("--auto", type=int, default=0, metavar="N",
@@ -1018,6 +1028,8 @@ if __name__ == "__main__":
                         help="Risk profile")
     parser.add_argument("--sweep", action="store_true",
                         help="Run all profiles and compare")
+    parser.add_argument("--chart", action="store_true",
+                        help="Show terminal bar charts (trade PnL, equity curve, signal weights)")
     args = parser.parse_args()
 
     if args.symbols:
@@ -1031,4 +1043,4 @@ if __name__ == "__main__":
         asyncio.run(run_sweep(symbols, args.days, args.equity))
     else:
         asyncio.run(run_backtest(symbols, args.days, args.equity, args.mode,
-                                  auto_symbols=args.auto))
+                                  auto_symbols=args.auto, show_chart=args.chart))

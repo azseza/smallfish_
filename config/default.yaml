@@ -1,5 +1,6 @@
 # ============================================================
-# BYBIT SCALPER — Master Configuration
+# SMALLFISH — Master Configuration
+# ><(((o>  microstructure tools for the small fish  <o)))><
 # ============================================================
 
 # --- Symbols ---
@@ -146,3 +147,33 @@ adaptive:
   weight_floor: 0.5                  # min multiplier on base weight
   weight_ceiling: 2.0                # max multiplier on base weight
   update_interval_trades: 50         # re-evaluate every N trades
+
+# --- Multigrid Strategy (optional, activate with --multigrid) ---
+multigrid:
+  enabled: false
+  levels: 5                          # grid levels per side (5 buys + 5 sells)
+  spacing_pct: 0.001                 # 0.1% between levels
+  qty_per_level_pct: 0.01            # 1% of equity per grid level
+  max_open_levels: 10                # max pending grid orders at once
+  bias_strength: 0.5                 # how much signal fusion shifts the grid center
+  recalc_interval_ms: 60000          # recalculate grid every 60s
+  harvest_pct: 0.001                 # min 0.1% profit to harvest a grid pair
+  regime_filter: true                # disable grid in extreme volatility
+
+# --- Terminal Dashboard (optional, activate with --dashboard) ---
+dashboard:
+  enabled: false
+  refresh_s: 2.0                     # screen refresh interval
+
+# --- Telegram Bot (optional, activate with --telegram) ---
+# Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env
+telegram:
+  enabled: false
+  notify_trades: false               # send message on every trade (can be noisy)
+  alert_cooldown_s: 300              # min seconds between repeated alerts
+
+# --- Email Alerts (optional, activate with --email-alerts) ---
+# Set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ALERT_EMAIL_TO in .env
+email:
+  enabled: false
+  cooldown_s: 600                    # min seconds between repeated alerts

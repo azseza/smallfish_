@@ -1,8 +1,9 @@
 [tool.poetry]
-name = "bybit_scalper"
-version = "1.0.0"
-description = "A high-frequency multi-signal fusion scalper for Bybit perpetual futures."
-authors = ["Your Name <you@example.com>"]
+name = "smallfish"
+version = "2.0.0"
+description = "Open-source signal-fusion scalping engine — microstructure tools for the small fish."
+license = "Apache-2.0"
+authors = ["Smallfish Contributors"]
 
 [tool.poetry.dependencies]
 python = "^3.10"
@@ -12,6 +13,8 @@ aiohttp = "^3.9"
 numpy = "^1.26"
 orjson = "^3.9"
 python-dotenv = "^1.0"
+python-telegram-bot = "^21.0"
+aiosmtplib = "^3.0"
 
 [tool.poetry.dev-dependencies]
 pytest = "^7.4"

@@ -1,9 +1,12 @@
-"""Bybit Scalper — Main Application.
+"""Smallfish — Main Application.
 
-High-frequency multi-signal fusion scalping bot for Bybit perpetual futures.
+Open-source signal-fusion scalping engine for Bybit perpetual futures.
 Async event-driven architecture processing orderbook and trade stream data.
+
+  ><(((o>  smallfish  <o)))><
 """
 from __future__ import annotations
+import argparse
 import asyncio
 import logging
 import os
@@ -35,7 +38,7 @@ from gateway.persistence import Persistence
 from monitor.heartbeat import Heartbeat
 from monitor import metrics as metrics_mod
 
-log = logging.getLogger("scalper")
+log = logging.getLogger("smallfish")
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -54,13 +57,30 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Smallfish — microstructure tools for the small fish"
+    )
+    parser.add_argument("--dashboard", action="store_true",
+                        help="Enable terminal dashboard with live bar charts")
+    parser.add_argument("--multigrid", action="store_true",
+                        help="Enable multigrid strategy layer")
+    parser.add_argument("--telegram", action="store_true",
+                        help="Enable Telegram bot for remote control")
+    parser.add_argument("--email-alerts", action="store_true",
+                        help="Enable email alerts for critical events")
+    return parser.parse_args()
+
+
 async def main() -> None:
     load_dotenv()
+    args = parse_args()
     config = load_config()
     setup_logging(config.get("log_level", "INFO"))
 
     log.info("=" * 60)
-    log.info("  BYBIT SCALPER v1.0 — Starting up")
+    log.info("  ><(((o>  SMALLFISH v2.0  <o)))><")
+    log.info("  microstructure tools for the small fish")
     log.info("=" * 60)
 
     api_key = os.environ.get("BYBIT_API_KEY", "")
@@ -72,6 +92,16 @@ async def main() -> None:
         return
 
     symbols = config.get("symbols", ["BTCUSDT"])
+
+    # --- CLI flag overrides ---
+    if args.dashboard:
+        config.setdefault("dashboard", {})["enabled"] = True
+    if args.multigrid:
+        config.setdefault("multigrid", {})["enabled"] = True
+    if args.telegram:
+        config.setdefault("telegram", {})["enabled"] = True
+    if args.email_alerts:
+        config.setdefault("email", {})["enabled"] = True
 
     # --- Dynamic Symbol Selection ---
     auto_symbols = int(os.environ.get("AUTO_SYMBOLS", "0"))
@@ -144,8 +174,46 @@ async def main() -> None:
     except Exception as e:
         log.error("Startup error: %s", e)
 
-    # --- Launch WebSocket in background ---
+    # --- Optional: Multigrid Strategy ---
+    grid = None
+    if config.get("multigrid", {}).get("enabled", False):
+        from strategies.multigrid import MultigridStrategy
+        grid = MultigridStrategy(config)
+        for sym in symbols:
+            grid.init_symbol(sym)
+        log.info("Multigrid strategy enabled (%d levels, %.2f%% spacing)",
+                 grid.num_levels, grid.spacing_pct * 100)
+
+    # --- Optional: Terminal Dashboard ---
+    dashboard = None
+    if config.get("dashboard", {}).get("enabled", False):
+        from monitor.dashboard import TerminalDashboard
+        dashboard = TerminalDashboard(state, config, grid_strategy=grid)
+        dashboard.enabled = True
+        log.info("Terminal dashboard enabled")
+
+    # --- Optional: Telegram Bot ---
+    telegram = None
+    if config.get("telegram", {}).get("enabled", False):
+        from remote.telegram_bot import TelegramBot
+        telegram = TelegramBot(state, config, grid_strategy=grid)
+        log.info("Telegram bot enabled")
+
+    # --- Optional: Email Alerts ---
+    email_alerter = None
+    if config.get("email", {}).get("enabled", False):
+        from remote.email_alert import EmailAlerter
+        email_alerter = EmailAlerter(state, config)
+        log.info("Email alerts enabled")
+
+    # --- Launch background services ---
     ws_task = asyncio.create_task(ws.start())
+
+    if telegram:
+        await telegram.start()
+
+    if dashboard:
+        dashboard.start()
 
     log.info("Waiting for WebSocket connection...")
     await asyncio.sleep(2)  # Give WS time to connect and receive initial data
@@ -159,12 +227,14 @@ async def main() -> None:
             evt = await ws.next_event(timeout_s=0.02)
             if evt is not None:
                 await process_public_event(evt, books, tapes, state, config,
-                                           router, oco, persistence, heartbeat)
+                                           router, oco, persistence, heartbeat,
+                                           grid=grid)
 
             # 2. Process private events (order fills, position updates)
             for prv_evt in ws.drain_private():
                 await process_private_event(prv_evt, state, config, books,
-                                            oco, persistence)
+                                            oco, persistence,
+                                            telegram=telegram, email_alerter=email_alerter)
 
             # 3. Manage open positions
             for sym in symbols:
@@ -172,10 +242,37 @@ async def main() -> None:
                     await manage_position(sym, state, books[sym], tapes[sym],
                                           config, oco, persistence)
 
-            # 4. Housekeeping
+            # 4. Multigrid: place/manage grid orders
+            if grid and grid.enabled:
+                for sym in symbols:
+                    book = books[sym]
+                    if book.is_fresh():
+                        mid = book.mid_price()
+                        grid.recalculate(
+                            sym, mid,
+                            state.last_direction,
+                            state.last_confidence,
+                            state.equity,
+                            state.vol_regime,
+                            time_now_ms(),
+                        )
+                        for level in grid.pending_orders(sym):
+                            order_id = await router.enter(
+                                sym, level.side, level.quantity, book)
+                            if order_id:
+                                grid.mark_order(sym, level.price, level.side, order_id)
+
+            # 5. Housekeeping
             state.update_latency(ws.latency_estimate_ms())
             heartbeat.check()
             persistence.flush_if_needed()
+
+            # 6. Remote alerts on kill switch
+            if state.kill_switch:
+                if telegram:
+                    await telegram.alert_kill_switch(state.kill_reason)
+                if email_alerter:
+                    await email_alerter.alert_kill_switch(state.kill_reason)
 
     except KeyboardInterrupt:
         log.info("Shutdown requested by user")
@@ -188,12 +285,25 @@ async def main() -> None:
         for sym in symbols:
             try:
                 await router.cancel_all(sym)
+                if grid:
+                    for oid in grid.cancel_all(sym):
+                        try:
+                            await rest.cancel_order(sym, oid)
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
         if state.positions:
             log.warning("Flattening %d open positions...", len(state.positions))
             await oco.flatten_all(state.positions)
+
+        if dashboard:
+            dashboard.stop()
+        if telegram:
+            await telegram.stop()
+        if email_alerter:
+            await email_alerter.send_daily_summary()
 
         await ws.stop()
         await rest.close()
@@ -214,6 +324,7 @@ async def process_public_event(
     oco: OcoManager,
     persistence: Persistence,
     heartbeat: Heartbeat,
+    grid=None,
 ) -> None:
     """Handle a public WebSocket event: book update or trade."""
     sym = evt.symbol
@@ -373,6 +484,8 @@ async def process_private_event(
     books: dict[str, OrderBook],
     oco: OcoManager,
     persistence: Persistence,
+    telegram=None,
+    email_alerter=None,
 ) -> None:
     """Handle private WS events: order fills, position updates."""
     if evt.event_type == EventType.EXECUTION:
@@ -432,6 +545,8 @@ async def process_private_event(
                     "duration_ms": result.duration_ms,
                     "exit_reason": reason,
                 })
+                if telegram:
+                    await telegram.alert_trade(result)
 
     elif evt.event_type == EventType.POSITION:
         data = evt.data
@@ -456,6 +571,16 @@ async def process_private_event(
                     "duration_ms": result.duration_ms,
                     "exit_reason": "position_closed",
                 })
+                if telegram:
+                    await telegram.alert_trade(result)
+
+    # Check drawdown alerts
+    if state.drawdown > 0.05:
+        dd_pct = state.drawdown * 100
+        if telegram:
+            await telegram.alert_drawdown(dd_pct)
+        if email_alerter:
+            await email_alerter.alert_drawdown(dd_pct)
 
 
 async def manage_position(
