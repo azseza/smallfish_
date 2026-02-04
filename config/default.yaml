@@ -3,24 +3,49 @@
 # ============================================================
 
 # --- Symbols ---
+# Static defaults — override with AUTO_SYMBOLS=N env var for dynamic selection
 symbols:
   - "BTCUSDT"
   - "ETHUSDT"
+  - "SOLUSDT"
+  - "XRPUSDT"
+  - "DOGEUSDT"
 
-# Tick sizes per symbol (quote currency per tick)
+# Tick sizes per symbol (auto-fetched when using scanner)
 tick_sizes:
   BTCUSDT: 0.10
   ETHUSDT: 0.01
+  SOLUSDT: 0.01
+  XRPUSDT: 0.0001
+  DOGEUSDT: 0.00001
+  ADAUSDT: 0.0001
+  SUIUSDT: 0.0001
+  BNBUSDT: 0.10
+  LINKUSDT: 0.001
 
 # Minimum order quantities
 min_qty:
   BTCUSDT: 0.001
   ETHUSDT: 0.01
+  SOLUSDT: 0.1
+  XRPUSDT: 1
+  DOGEUSDT: 1
+  ADAUSDT: 1
+  SUIUSDT: 0.1
+  BNBUSDT: 0.01
+  LINKUSDT: 0.1
 
 # Qty step (precision)
 qty_step:
   BTCUSDT: 0.001
   ETHUSDT: 0.01
+  SOLUSDT: 0.1
+  XRPUSDT: 1
+  DOGEUSDT: 1
+  ADAUSDT: 1
+  SUIUSDT: 0.1
+  BNBUSDT: 0.01
+  LINKUSDT: 0.1
 
 # --- Account ---
 leverage: 10

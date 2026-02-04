@@ -73,6 +73,21 @@ async def main() -> None:
 
     symbols = config.get("symbols", ["BTCUSDT"])
 
+    # --- Dynamic Symbol Selection ---
+    auto_symbols = int(os.environ.get("AUTO_SYMBOLS", "0"))
+    if auto_symbols > 0:
+        from marketdata.scanner import scan_top_symbols, apply_specs_to_config
+        log.info("Scanning for top %d symbols to trade...", auto_symbols)
+        top = await scan_top_symbols(n=auto_symbols, testnet=testnet)
+        if top:
+            apply_specs_to_config(config, top)
+            symbols = config["symbols"]
+            for s in top:
+                log.info("  %s  vol=$%.0fM  chg=%+.1f%%",
+                         s["symbol"], s["volume_24h_usd"]/1e6, s["change_24h_pct"])
+        else:
+            log.warning("Scanner returned no symbols, using config defaults")
+
     # --- Initialize Components ---
     state = RuntimeState(config)
     persistence = Persistence()

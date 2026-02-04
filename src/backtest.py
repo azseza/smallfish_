@@ -38,6 +38,7 @@ from marketdata.tape import TradeTape
 import marketdata.features as features
 import signals.fuse as fuse
 import exec.risk as risk
+from marketdata.scanner import scan_top_symbols, apply_specs_to_config
 
 log = logging.getLogger("backtest")
 
@@ -55,6 +56,7 @@ PROFILES = {
         "cooldown_ms": 60_000,   # 1 minute between entries
         "max_hold": 15,          # 15 candle max hold
         "max_daily_R": 10,       # daily loss limit
+        "max_positions": 2,      # max concurrent positions
         "C_enter": 0.55,
         "C_exit": 0.35,
         "alpha": 4,
@@ -72,6 +74,7 @@ PROFILES = {
         "cooldown_ms": 45_000,   # 45s cooldown
         "max_hold": 12,
         "max_daily_R": 15,       # higher limit for more risk
+        "max_positions": 3,      # max concurrent positions
         "C_enter": 0.53,
         "C_exit": 0.33,
         "alpha": 4,
@@ -89,6 +92,7 @@ PROFILES = {
         "cooldown_ms": 30_000,   # 30s cooldown
         "max_hold": 12,
         "max_daily_R": 20,       # high daily allowance
+        "max_positions": 3,      # max concurrent positions
         "C_enter": 0.52,
         "C_exit": 0.30,
         "alpha": 4,
@@ -106,6 +110,7 @@ PROFILES = {
         "cooldown_ms": 20_000,   # 20s cooldown
         "max_hold": 12,
         "max_daily_R": 30,       # very high daily allowance
+        "max_positions": 4,      # max concurrent positions
         "C_enter": 0.50,
         "C_exit": 0.28,
         "alpha": 3.5,
@@ -309,6 +314,7 @@ class BacktestEngine:
         self._trail_pct = p["trail_pct"]
         self._min_entry_gap_ms = p["cooldown_ms"]
         self._max_hold_candles = p["max_hold"]
+        self._max_positions = p.get("max_positions", 2)
         self._conf_scale = p["conf_scale"]
         self._breakeven_R = p["breakeven_R"]
         self._partial_tp = p["partial_tp"]
@@ -397,6 +403,10 @@ class BacktestEngine:
             return  # don't look for new entries on same symbol
 
         if self.state.kill_switch:
+            return
+
+        # Max concurrent positions across all symbols
+        if self.state.open_position_count() >= self._max_positions:
             return
 
         # Rate limit per symbol
@@ -716,11 +726,35 @@ class BacktestEngine:
 # ─── Main ─────────────────────────────────────────────────────────────────
 
 async def run_backtest(symbols: List[str], days: int = 30, equity: float = 50.0,
-                       profile: str = "conservative"):
+                       profile: str = "conservative", auto_symbols: int = 0):
     # Load config
     config_path = os.path.join(os.path.dirname(__file__), "..", "config", "default.yaml")
     with open(config_path) as f:
         config = yaml.safe_load(f)
+
+    # Auto-scan for best symbols
+    if auto_symbols > 0:
+        print(f"\n  Scanning for top {auto_symbols} symbols to scalp...")
+        top = await scan_top_symbols(n=auto_symbols, min_volume_usd=30_000_000)
+        if top:
+            apply_specs_to_config(config, top)
+            symbols = [s["symbol"] for s in top]
+            print(f"  Selected: {', '.join(symbols)}")
+            for s in top:
+                vol_m = s['volume_24h_usd'] / 1e6
+                print(f"    {s['symbol']:<14} vol=${vol_m:,.0f}M  chg={s['change_24h_pct']:+.1f}%  tick={s['tick_size']}")
+            print()
+        else:
+            print("  Scanner found no symbols, using defaults")
+    else:
+        # Fetch specs for provided symbols
+        from marketdata.scanner import fetch_instruments
+        specs = await fetch_instruments()
+        for sym in symbols:
+            if sym in specs:
+                config.setdefault("tick_sizes", {})[sym] = specs[sym]["tick_size"]
+                config.setdefault("min_qty", {})[sym] = specs[sym]["min_qty"]
+                config.setdefault("qty_step", {})[sym] = specs[sym]["qty_step"]
 
     sym_str = "+".join(symbols)
     log.info("=" * 60)
@@ -974,19 +1008,27 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Bybit Scalper Backtest")
     parser.add_argument("--symbol", default="BTCUSDT", help="Trading symbol")
-    parser.add_argument("--multi", action="store_true", help="Trade both BTCUSDT + ETHUSDT")
+    parser.add_argument("--symbols", nargs="+", help="Multiple symbols: --symbols BTCUSDT ETHUSDT SOLUSDT")
+    parser.add_argument("--auto", type=int, default=0, metavar="N",
+                        help="Auto-select top N symbols by volume+volatility")
     parser.add_argument("--days", type=int, default=30, help="Number of days to backtest")
     parser.add_argument("--equity", type=float, default=50.0, help="Initial equity in USD")
-    parser.add_argument("--mode", default="conservative",
+    parser.add_argument("--mode", default="aggressive",
                         choices=["conservative", "balanced", "aggressive", "ultra"],
                         help="Risk profile")
     parser.add_argument("--sweep", action="store_true",
                         help="Run all profiles and compare")
     args = parser.parse_args()
 
-    symbols = ["BTCUSDT", "ETHUSDT"] if args.multi else [args.symbol]
+    if args.symbols:
+        symbols = args.symbols
+    elif args.auto > 0:
+        symbols = []  # will be filled by scanner
+    else:
+        symbols = [args.symbol]
 
     if args.sweep:
         asyncio.run(run_sweep(symbols, args.days, args.equity))
     else:
-        asyncio.run(run_backtest(symbols, args.days, args.equity, args.mode))
+        asyncio.run(run_backtest(symbols, args.days, args.equity, args.mode,
+                                  auto_symbols=args.auto))
