@@ -15,9 +15,9 @@ class TestPositionSize:
             [[50000.0, 1.0], [49999.9, 1.0]],
             [[50000.1, 1.0], [50000.2, 1.0]],
         )
-        qty = risk.position_size(state, book, stop_ticks=3, symbol="BTCUSDT")
+        # stop_distance in price terms: 3 ticks * $0.10 = $0.30
+        qty = risk.position_size(state, book, 0.30, symbol="BTCUSDT")
         # risk = min(0.005 * 1000, 5.0) = $5.0
-        # stop_distance = 3 * 0.10 = $0.30
         # qty = 5.0 / 0.30 = 16.666 → rounded down to step
         assert qty > 0
         assert qty <= 200  # leverage cap
@@ -26,7 +26,7 @@ class TestPositionSize:
         state = RuntimeState(config)
         book = OrderBook(symbol="BTCUSDT", depth=10, tick_size=0.10)
         book.on_snapshot([[50000.0, 1.0]], [[50000.1, 1.0]])
-        qty = risk.position_size(state, book, stop_ticks=0, symbol="BTCUSDT")
+        qty = risk.position_size(state, book, 0.0, symbol="BTCUSDT")
         assert qty == 0.0
 
     def test_drawdown_reduces_size(self, config):
@@ -35,14 +35,15 @@ class TestPositionSize:
         book = OrderBook(symbol="BTCUSDT", depth=10, tick_size=0.10)
         book.on_snapshot([[50000.0, 1.0]], [[50000.1, 1.0]])
 
-        qty_full = risk.position_size(state, book, 3, "BTCUSDT")
+        # stop_distance in price terms: 3 ticks * $0.10 = $0.30
+        qty_full = risk.position_size(state, book, 0.30, "BTCUSDT")
 
         # Simulate 6% drawdown (0.25 multiplier tier)
         state.peak_equity = 1000
         state.equity = 940
         state.drawdown = 0.06
 
-        qty_reduced = risk.position_size(state, book, 3, "BTCUSDT")
+        qty_reduced = risk.position_size(state, book, 0.30, "BTCUSDT")
         assert qty_reduced < qty_full
 
 
@@ -96,17 +97,36 @@ class TestCanTrade:
 
 class TestComputeStops:
     def test_long_stops(self, config, sample_book):
-        stop, tp, stop_ticks = risk.compute_stops(sample_book, 1, config, "BTCUSDT")
+        stop, tp, stop_distance = risk.compute_stops(sample_book, 1, config, "BTCUSDT")
         mid = sample_book.mid_price()
         assert stop < mid
         assert tp > mid
-        assert stop_ticks == 3
+        # Without profile, falls back to fixed-tick stops:
+        # stop_distance = base_stop_ticks(3) * tick_size(0.10) = 0.30
+        assert abs(stop_distance - 0.30) < 0.01
 
     def test_short_stops(self, config, sample_book):
-        stop, tp, stop_ticks = risk.compute_stops(sample_book, -1, config, "BTCUSDT")
+        stop, tp, stop_distance = risk.compute_stops(sample_book, -1, config, "BTCUSDT")
         mid = sample_book.mid_price()
         assert stop > mid
         assert tp < mid
+
+    def test_profile_volatility_adapted_stops(self, config, sample_book):
+        """When profile is active and avg_range provided, uses volatility-adapted stops."""
+        config["profile"] = {
+            "name": "aggressive",
+            "sl_range_mult": 0.50,
+            "tp_range_mult": 1.60,
+        }
+        # avg_range of $100 → stop_distance = 100 * 0.50 = $50
+        stop, tp, stop_distance = risk.compute_stops(
+            sample_book, 1, config, "BTCUSDT", avg_range=100.0)
+        mid = sample_book.mid_price()
+        assert abs(stop_distance - 50.0) < 0.01
+        assert stop < mid
+        assert tp > mid
+        assert abs(mid - stop - 50.0) < 0.01
+        assert abs(tp - mid - 160.0) < 0.01
 
 
 class TestSlippage:

@@ -17,7 +17,7 @@ from typing import Optional
 from core.types import Side, OrderType, TimeInForce, OrderStatus
 from core.utils import time_now_ms, tick_round
 from marketdata.book import OrderBook
-from gateway.rest import BybitREST
+from gateway.base import ExchangeREST, OrderResponse
 
 log = logging.getLogger(__name__)
 
@@ -25,7 +25,7 @@ log = logging.getLogger(__name__)
 class OrderRouter:
     """Manages order entry with smart routing and fallback logic."""
 
-    def __init__(self, rest: BybitREST, config: dict):
+    def __init__(self, rest: ExchangeREST, config: dict):
         self.rest = rest
         self.config = config
 
@@ -73,7 +73,7 @@ class OrderRouter:
                 if price_moved >= reprice_ticks and reprice_count < max_reprices:
                     # Try to amend the order to new price
                     result = await self.rest.amend_order(symbol, order_id, price=new_price)
-                    if result.get("retCode", -1) == 0:
+                    if result.success:
                         price = new_price
                         reprice_count += 1
                         log.info("Repriced order %s to %.2f (attempt %d)",
@@ -116,10 +116,9 @@ class OrderRouter:
             order_type=OrderType.LIMIT,
             time_in_force=TimeInForce.IOC,
         )
-        order_id = result.get("result", {}).get("orderId", "")
-        if order_id:
+        if result.order_id:
             log.info("IOC order sent: %s %s qty=%.6f @ %.2f", side.name, symbol, qty, price)
-        return order_id or None
+        return result.order_id or None
 
     async def market_close(self, symbol: str, side: Side, qty: float) -> Optional[str]:
         """Emergency market order to flatten a position."""
@@ -130,13 +129,12 @@ class OrderRouter:
             order_type=OrderType.MARKET,
             reduce_only=True,
         )
-        order_id = result.get("result", {}).get("orderId", "")
-        log.info("Market close: %s %s qty=%.6f → %s", side.name, symbol, qty, order_id)
-        return order_id or None
+        log.info("Market close: %s %s qty=%.6f -> %s", side.name, symbol, qty, result.order_id)
+        return result.order_id or None
 
     async def cancel(self, symbol: str, order_id: str) -> bool:
         result = await self.rest.cancel_order(symbol, order_id)
-        return result.get("retCode", -1) == 0
+        return result.success
 
     async def cancel_all(self, symbol: str) -> None:
         await self.rest.cancel_all_orders(symbol)
@@ -163,11 +161,10 @@ class OrderRouter:
             order_type=OrderType.LIMIT,
             time_in_force=TimeInForce.POST_ONLY,
         )
-        order_id = result.get("result", {}).get("orderId", "")
-        if order_id:
-            log.info("Post-only limit: %s %s qty=%.6f @ %.2f → %s",
-                     side.name, symbol, qty, price, order_id)
-        return order_id or None
+        if result.order_id:
+            log.info("Post-only limit: %s %s qty=%.6f @ %.2f -> %s",
+                     side.name, symbol, qty, price, result.order_id)
+        return result.order_id or None
 
     async def _safe_cancel(self, symbol: str, order_id: str) -> None:
         try:

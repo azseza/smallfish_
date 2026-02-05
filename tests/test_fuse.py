@@ -2,6 +2,25 @@
 import pytest
 from signals.fuse import get_weights, meta, confidence, decide, score_all, count_agreement
 
+# Helper: full 13-signal weight dict
+WEIGHTS_13 = {
+    "w": [0.22, 0.10, 0.15],
+    "v": [0.08, 0.05, 0.03],
+    "x": [0.05, 0.02],
+    "t": [0.07, 0.05, 0.06, 0.06, 0.06],
+}
+
+# Helper: all-zero scores for 13 signals
+ALL_SCORE_KEYS = [
+    "obi_long", "obi_short", "prt_long", "prt_short",
+    "umom_long", "umom_short", "ltb_long", "ltb_short",
+    "sweep_up", "sweep_down", "ice_long", "ice_short",
+    "vwap_long", "vwap_short", "regime_long", "regime_short",
+    "cvd_long", "cvd_short", "tps_long", "tps_short",
+    "liq_long", "liq_short", "mvr_long", "mvr_short",
+    "absorb_long", "absorb_short",
+]
+
 
 class TestMeta:
     def test_meta_long_positive_with_long_signals(self):
@@ -14,9 +33,13 @@ class TestMeta:
             "ice_long": 0.0, "ice_short": 0.0,
             "vwap_long": 0.0, "vwap_short": 0.0,
             "regime_long": 0.5, "regime_short": 0.5,
+            "cvd_long": 0.0, "cvd_short": 0.0,
+            "tps_long": 0.0, "tps_short": 0.0,
+            "liq_long": 0.0, "liq_short": 0.0,
+            "mvr_long": 0.0, "mvr_short": 0.0,
+            "absorb_long": 0.0, "absorb_short": 0.0,
         }
-        weights = {"w": [0.30, 0.15, 0.20], "v": [0.12, 0.08, 0.05], "x": [0.07, 0.03]}
-        ml, ms = meta(scores, weights)
+        ml, ms = meta(scores, WEIGHTS_13)
         assert ml > ms
         assert ml > 0
 
@@ -30,21 +53,29 @@ class TestMeta:
             "ice_long": 0.0, "ice_short": 0.0,
             "vwap_long": 0.0, "vwap_short": 0.0,
             "regime_long": 0.5, "regime_short": 0.5,
+            "cvd_long": 0.0, "cvd_short": 0.0,
+            "tps_long": 0.0, "tps_short": 0.0,
+            "liq_long": 0.0, "liq_short": 0.0,
+            "mvr_long": 0.0, "mvr_short": 0.0,
+            "absorb_long": 0.0, "absorb_short": 0.0,
         }
-        weights = {"w": [0.30, 0.15, 0.20], "v": [0.12, 0.08, 0.05], "x": [0.07, 0.03]}
-        ml, ms = meta(scores, weights)
+        ml, ms = meta(scores, WEIGHTS_13)
         assert ms > ml
 
     def test_zero_scores_give_zero_meta(self):
-        scores = {k: 0.0 for k in [
-            "obi_long", "obi_short", "prt_long", "prt_short",
-            "umom_long", "umom_short", "ltb_long", "ltb_short",
-            "sweep_up", "sweep_down", "ice_long", "ice_short",
-            "vwap_long", "vwap_short", "regime_long", "regime_short",
-        ]}
-        weights = {"w": [0.30, 0.15, 0.20], "v": [0.12, 0.08, 0.05], "x": [0.07, 0.03]}
-        ml, ms = meta(scores, weights)
+        scores = {k: 0.0 for k in ALL_SCORE_KEYS}
+        ml, ms = meta(scores, WEIGHTS_13)
         assert ml == 0.0
+        assert ms == 0.0
+
+    def test_new_signals_contribute_to_meta(self):
+        """New t-group signals should contribute to meta scores."""
+        scores = {k: 0.0 for k in ALL_SCORE_KEYS}
+        scores["cvd_long"] = 0.8
+        scores["tps_long"] = 0.6
+        scores["liq_long"] = 0.5
+        ml, ms = meta(scores, WEIGHTS_13)
+        assert ml > 0
         assert ms == 0.0
 
 
@@ -65,31 +96,19 @@ class TestConfidence:
 
 class TestDecide:
     def test_long_decision(self):
-        scores = {
-            "obi_long": 0.9, "obi_short": 0.0,
-            "prt_long": 0.0, "prt_short": 0.0,
-            "umom_long": 0.8, "umom_short": 0.0,
-            "ltb_long": 0.0, "ltb_short": 0.0,
-            "sweep_up": 0.0, "sweep_down": 0.0,
-            "ice_long": 0.0, "ice_short": 0.0,
-            "vwap_long": 0.0, "vwap_short": 0.0,
-            "regime_long": 0.5, "regime_short": 0.5,
-        }
-        weights = {"w": [0.30, 0.15, 0.20], "v": [0.12, 0.08, 0.05], "x": [0.07, 0.03]}
-        direction, conf, raw = decide(scores, weights, 5.0, 1.0)
+        scores = {k: 0.0 for k in ALL_SCORE_KEYS}
+        scores["obi_long"] = 0.9
+        scores["umom_long"] = 0.8
+        scores["regime_long"] = 0.5
+        scores["regime_short"] = 0.5
+        direction, conf, raw = decide(scores, WEIGHTS_13, 5.0, 1.0)
         assert direction == 1
         assert conf > 0.5
         assert raw > 0
 
     def test_no_trade_on_zero_signals(self):
-        scores = {k: 0.0 for k in [
-            "obi_long", "obi_short", "prt_long", "prt_short",
-            "umom_long", "umom_short", "ltb_long", "ltb_short",
-            "sweep_up", "sweep_down", "ice_long", "ice_short",
-            "vwap_long", "vwap_short", "regime_long", "regime_short",
-        ]}
-        weights = {"w": [0.30, 0.15, 0.20], "v": [0.12, 0.08, 0.05], "x": [0.07, 0.03]}
-        direction, conf, raw = decide(scores, weights, 5.0, 1.0)
+        scores = {k: 0.0 for k in ALL_SCORE_KEYS}
+        direction, conf, raw = decide(scores, WEIGHTS_13, 5.0, 1.0)
         assert direction == 0
         assert conf == 0.0
 
@@ -105,101 +124,61 @@ class TestCountAgreement:
             "ice_long": 0.1, "ice_short": 0.0,
             "vwap_long": 0.4, "vwap_short": 0.0,
             "regime_long": 0.3, "regime_short": 0.0,
+            "cvd_long": 0.4, "cvd_short": 0.0,
+            "tps_long": 0.3, "tps_short": 0.0,
+            "liq_long": 0.2, "liq_short": 0.0,
+            "mvr_long": 0.3, "mvr_short": 0.0,
+            "absorb_long": 0.1, "absorb_short": 0.0,
         }
-        assert count_agreement(scores, 1) == 8
+        assert count_agreement(scores, 1) == 13
 
     def test_only_obi_agrees(self):
-        scores = {
-            "obi_long": 0.9, "obi_short": 0.0,
-            "prt_long": 0.0, "prt_short": 0.0,
-            "umom_long": 0.0, "umom_short": 0.0,
-            "ltb_long": 0.0, "ltb_short": 0.0,
-            "sweep_up": 0.0, "sweep_down": 0.0,
-            "ice_long": 0.0, "ice_short": 0.0,
-            "vwap_long": 0.0, "vwap_short": 0.0,
-            "regime_long": 0.0, "regime_short": 0.0,
-        }
+        scores = {k: 0.0 for k in ALL_SCORE_KEYS}
+        scores["obi_long"] = 0.9
         assert count_agreement(scores, 1) == 1
 
     def test_short_direction_counts_short_scores(self):
-        scores = {
-            "obi_long": 0.0, "obi_short": 0.8,
-            "prt_long": 0.0, "prt_short": 0.6,
-            "umom_long": 0.0, "umom_short": 0.0,
-            "ltb_long": 0.0, "ltb_short": 0.0,
-            "sweep_up": 0.0, "sweep_down": 0.3,
-            "ice_long": 0.0, "ice_short": 0.0,
-            "vwap_long": 0.0, "vwap_short": 0.0,
-            "regime_long": 0.0, "regime_short": 0.0,
-        }
-        assert count_agreement(scores, -1) == 3
+        scores = {k: 0.0 for k in ALL_SCORE_KEYS}
+        scores["obi_short"] = 0.8
+        scores["prt_short"] = 0.6
+        scores["sweep_down"] = 0.3
+        scores["cvd_short"] = 0.4
+        assert count_agreement(scores, -1) == 4
 
     def test_zero_direction_returns_zero(self):
         scores = {"obi_long": 0.9}
         assert count_agreement(scores, 0) == 0
 
     def test_below_threshold_not_counted(self):
-        scores = {
-            "obi_long": 0.04, "obi_short": 0.0,  # below 0.05 threshold
-            "prt_long": 0.06, "prt_short": 0.0,   # above threshold
-            "umom_long": 0.0, "umom_short": 0.0,
-            "ltb_long": 0.0, "ltb_short": 0.0,
-            "sweep_up": 0.0, "sweep_down": 0.0,
-            "ice_long": 0.0, "ice_short": 0.0,
-            "vwap_long": 0.0, "vwap_short": 0.0,
-            "regime_long": 0.0, "regime_short": 0.0,
-        }
+        scores = {k: 0.0 for k in ALL_SCORE_KEYS}
+        scores["obi_long"] = 0.04  # below 0.05 threshold
+        scores["prt_long"] = 0.06  # above threshold
         assert count_agreement(scores, 1) == 1
 
 
 class TestMinSignals:
     def test_decide_blocked_by_min_signals(self):
         """Single strong signal should be blocked when min_signals=3."""
-        scores = {
-            "obi_long": 0.9, "obi_short": 0.0,
-            "prt_long": 0.0, "prt_short": 0.0,
-            "umom_long": 0.0, "umom_short": 0.0,
-            "ltb_long": 0.0, "ltb_short": 0.0,
-            "sweep_up": 0.0, "sweep_down": 0.0,
-            "ice_long": 0.0, "ice_short": 0.0,
-            "vwap_long": 0.0, "vwap_short": 0.0,
-            "regime_long": 0.0, "regime_short": 0.0,
-        }
-        weights = {"w": [0.30, 0.15, 0.20], "v": [0.12, 0.08, 0.05], "x": [0.07, 0.03]}
-        direction, conf, raw = decide(scores, weights, 5.0, 1.0, min_signals=3)
+        scores = {k: 0.0 for k in ALL_SCORE_KEYS}
+        scores["obi_long"] = 0.9
+        direction, conf, raw = decide(scores, WEIGHTS_13, 5.0, 1.0, min_signals=3)
         assert direction == 0  # blocked: only 1 signal agrees
 
     def test_decide_passes_with_enough_signals(self):
         """Three agreeing signals should pass min_signals=3."""
-        scores = {
-            "obi_long": 0.8, "obi_short": 0.0,
-            "prt_long": 0.5, "prt_short": 0.0,
-            "umom_long": 0.6, "umom_short": 0.0,
-            "ltb_long": 0.0, "ltb_short": 0.0,
-            "sweep_up": 0.0, "sweep_down": 0.0,
-            "ice_long": 0.0, "ice_short": 0.0,
-            "vwap_long": 0.0, "vwap_short": 0.0,
-            "regime_long": 0.0, "regime_short": 0.0,
-        }
-        weights = {"w": [0.30, 0.15, 0.20], "v": [0.12, 0.08, 0.05], "x": [0.07, 0.03]}
-        direction, conf, raw = decide(scores, weights, 5.0, 1.0, min_signals=3)
+        scores = {k: 0.0 for k in ALL_SCORE_KEYS}
+        scores["obi_long"] = 0.8
+        scores["prt_long"] = 0.5
+        scores["umom_long"] = 0.6
+        direction, conf, raw = decide(scores, WEIGHTS_13, 5.0, 1.0, min_signals=3)
         assert direction == 1
         assert conf > 0.5
 
     def test_decide_no_filter_when_min_signals_zero(self):
         """min_signals=0 should not filter anything."""
-        scores = {
-            "obi_long": 0.9, "obi_short": 0.0,
-            "prt_long": 0.0, "prt_short": 0.0,
-            "umom_long": 0.0, "umom_short": 0.0,
-            "ltb_long": 0.0, "ltb_short": 0.0,
-            "sweep_up": 0.0, "sweep_down": 0.0,
-            "ice_long": 0.0, "ice_short": 0.0,
-            "vwap_long": 0.0, "vwap_short": 0.0,
-            "regime_long": 0.0, "regime_short": 0.0,
-        }
-        weights = {"w": [0.30, 0.15, 0.20], "v": [0.12, 0.08, 0.05], "x": [0.07, 0.03]}
-        direction, conf, raw = decide(scores, weights, 5.0, 1.0, min_signals=0)
+        scores = {k: 0.0 for k in ALL_SCORE_KEYS}
+        scores["obi_long"] = 0.9
+        direction, conf, raw = decide(scores, WEIGHTS_13, 5.0, 1.0, min_signals=0)
         assert direction == 1  # should pass — no filter
 
 
@@ -207,6 +186,7 @@ class TestAdaptiveWeights:
     def test_no_edges_returns_base_weights(self, config):
         weights = get_weights(config, None, None)
         assert weights["w"] == config["weights"]["w"]
+        assert weights["t"] == config["weights"]["t"]
 
     def test_adaptive_disabled_returns_base(self, config):
         edges = {"obi": 0.01, "prt": 0.005}
@@ -216,12 +196,15 @@ class TestAdaptiveWeights:
 
     def test_adaptive_adjusts_weights(self, config):
         edges = {"obi": 0.02, "prt": 0.001, "umom": 0.01,
-                 "ltb": 0.005, "sweep": 0.003, "ice": 0.002, "vwap": 0.004}
+                 "ltb": 0.005, "sweep": 0.003, "ice": 0.002,
+                 "vwap": 0.004, "cvd": 0.008, "tps": 0.003,
+                 "liq": 0.004, "mvr": 0.006, "absorb": 0.005}
         adaptive = {
             "enabled": True, "lookback_trades": 100,
             "min_edge": 0.0001, "weight_floor": 0.5, "weight_ceiling": 2.0,
         }
         weights = get_weights(config, edges, adaptive)
         # OBI has highest edge → should get boosted relative to PRT
-        # (after normalization, obi should still be > prt weight)
         assert weights["w"][0] > weights["w"][1]  # obi > prt
+        # Verify t group exists and is adjusted
+        assert len(weights["t"]) == 5

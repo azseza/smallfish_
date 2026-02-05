@@ -22,6 +22,7 @@ def get_weights(config: dict, signal_edges: Dict[str, float] = None,
         "w": list(config["weights"]["w"]),
         "v": list(config["weights"]["v"]),
         "x": list(config["weights"].get("x", [0.07, 0.03])),
+        "t": list(config["weights"].get("t", [0.07, 0.05, 0.06, 0.06, 0.06])),
     }
 
     if not signal_edges or not adaptive_cfg or not adaptive_cfg.get("enabled"):
@@ -41,6 +42,11 @@ def get_weights(config: dict, signal_edges: Dict[str, float] = None,
         "ice": ("v", 2),
         "vwap": ("x", 0),
         "regime": ("x", 1),
+        "cvd": ("t", 0),
+        "tps": ("t", 1),
+        "liq": ("t", 2),
+        "mvr": ("t", 3),
+        "absorb": ("t", 4),
     }
 
     # Compute baseline edge (average across all signals)
@@ -60,9 +66,9 @@ def get_weights(config: dict, signal_edges: Dict[str, float] = None,
         weights[group][idx] *= multiplier
 
     # Re-normalize so total weights sum to 1
-    total = sum(weights["w"]) + sum(weights["v"]) + sum(weights["x"])
+    total = sum(weights["w"]) + sum(weights["v"]) + sum(weights["x"]) + sum(weights["t"])
     if total > 0:
-        for group in ("w", "v", "x"):
+        for group in ("w", "v", "x", "t"):
             weights[group] = [w / total for w in weights[group]]
 
     return weights
@@ -76,6 +82,11 @@ def score_all(features: dict, config: dict) -> dict:
     import signals.whale as whale_mod
     import signals.vwap as vwap_mod
     import signals.regime as regime_mod
+    import signals.cvd as cvd_mod
+    import signals.tps as tps_mod
+    import signals.liq as liq_mod
+    import signals.mvr as mvr_mod
+    import signals.absorb as absorb_mod
 
     s: dict = {}
 
@@ -99,6 +110,21 @@ def score_all(features: dict, config: dict) -> dict:
     regime_l, regime_s = regime_mod.calculate(features)
     s["regime_long"], s["regime_short"] = regime_l, regime_s
 
+    cvd_l, cvd_s = cvd_mod.calculate(features)
+    s["cvd_long"], s["cvd_short"] = cvd_l, cvd_s
+
+    tps_l, tps_s = tps_mod.calculate(features)
+    s["tps_long"], s["tps_short"] = tps_l, tps_s
+
+    liq_l, liq_s = liq_mod.calculate(features)
+    s["liq_long"], s["liq_short"] = liq_l, liq_s
+
+    mvr_l, mvr_s = mvr_mod.calculate(features)
+    s["mvr_long"], s["mvr_short"] = mvr_l, mvr_s
+
+    absorb_l, absorb_s = absorb_mod.calculate(features)
+    s["absorb_long"], s["absorb_short"] = absorb_l, absorb_s
+
     return s
 
 
@@ -107,6 +133,7 @@ def meta(scores: dict, weights: dict) -> Tuple[float, float]:
     w = weights["w"]
     v = weights["v"]
     x = weights.get("x", [0.0, 0.0])
+    t = weights.get("t", [0.0, 0.0, 0.0, 0.0, 0.0])
 
     meta_long = (
         w[0] * scores.get("obi_long", 0.0) +
@@ -116,7 +143,12 @@ def meta(scores: dict, weights: dict) -> Tuple[float, float]:
         v[1] * scores.get("sweep_up", 0.0) +
         v[2] * scores.get("ice_long", 0.0) +
         x[0] * scores.get("vwap_long", 0.0) +
-        x[1] * scores.get("regime_long", 0.0)
+        x[1] * scores.get("regime_long", 0.0) +
+        t[0] * scores.get("cvd_long", 0.0) +
+        t[1] * scores.get("tps_long", 0.0) +
+        t[2] * scores.get("liq_long", 0.0) +
+        t[3] * scores.get("mvr_long", 0.0) +
+        t[4] * scores.get("absorb_long", 0.0)
     )
 
     meta_short = (
@@ -127,7 +159,12 @@ def meta(scores: dict, weights: dict) -> Tuple[float, float]:
         v[1] * scores.get("sweep_down", 0.0) +
         v[2] * scores.get("ice_short", 0.0) +
         x[0] * scores.get("vwap_short", 0.0) +
-        x[1] * scores.get("regime_short", 0.0)
+        x[1] * scores.get("regime_short", 0.0) +
+        t[0] * scores.get("cvd_short", 0.0) +
+        t[1] * scores.get("tps_short", 0.0) +
+        t[2] * scores.get("liq_short", 0.0) +
+        t[3] * scores.get("mvr_short", 0.0) +
+        t[4] * scores.get("absorb_short", 0.0)
     )
 
     return meta_long, meta_short
@@ -139,11 +176,11 @@ def confidence(raw: float, alpha: float, quality_gate: float) -> float:
 
 
 def count_agreement(scores: dict, direction: int) -> int:
-    """Count how many of the 8 signal categories agree with the direction.
+    """Count how many of the 13 signal categories agree with the direction.
 
-    Each signal category (obi, prt, umom, ltb, sweep, ice, vwap, regime)
-    counts as agreeing if its score in the given direction exceeds a
-    minimum threshold (0.05).
+    Each signal category (obi, prt, umom, ltb, sweep, ice, vwap, regime,
+    cvd, tps, liq, mvr, absorb) counts as agreeing if its score in the
+    given direction exceeds a minimum threshold (0.05).
     """
     if direction == 0:
         return 0
@@ -160,6 +197,11 @@ def count_agreement(scores: dict, direction: int) -> int:
             scores.get("ice_long", 0.0),
             scores.get("vwap_long", 0.0),
             scores.get("regime_long", 0.0),
+            scores.get("cvd_long", 0.0),
+            scores.get("tps_long", 0.0),
+            scores.get("liq_long", 0.0),
+            scores.get("mvr_long", 0.0),
+            scores.get("absorb_long", 0.0),
         ]
     else:
         pairs = [
@@ -171,6 +213,11 @@ def count_agreement(scores: dict, direction: int) -> int:
             scores.get("ice_short", 0.0),
             scores.get("vwap_short", 0.0),
             scores.get("regime_short", 0.0),
+            scores.get("cvd_short", 0.0),
+            scores.get("tps_short", 0.0),
+            scores.get("liq_short", 0.0),
+            scores.get("mvr_short", 0.0),
+            scores.get("absorb_short", 0.0),
         ]
 
     return sum(1 for s in pairs if s > threshold)

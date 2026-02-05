@@ -15,8 +15,12 @@ import orjson
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from core.types import WsEvent, EventType, Trade, Side, Execution, OrderStatus
+from core.types import (
+    WsEvent, EventType, Trade, Side,
+    NormalizedExecution, NormalizedOrderUpdate, NormalizedPositionUpdate,
+)
 from core.utils import time_now_ms
+from gateway.base import ExchangeWS
 
 log = logging.getLogger(__name__)
 
@@ -26,7 +30,7 @@ PRIVATE_URL = "wss://stream.bybit.com/v5/private"
 PRIVATE_URL_TESTNET = "wss://stream-testnet.bybit.com/v5/private"
 
 
-class BybitWS:
+class BybitWS(ExchangeWS):
     """Async WebSocket client for Bybit V5."""
 
     def __init__(
@@ -171,7 +175,6 @@ class BybitWS:
             except Exception:
                 continue
 
-            # Heartbeat / subscription response
             if "op" in data:
                 continue
 
@@ -247,25 +250,48 @@ class BybitWS:
         items = data if isinstance(data, list) else [data]
 
         for item in items:
-            if topic == "order":
-                events.append(WsEvent(
-                    event_type=EventType.ORDER,
-                    symbol=item.get("symbol", ""),
-                    data=item,
-                    timestamp=now,
-                ))
-            elif topic == "execution":
+            if topic == "execution":
                 events.append(WsEvent(
                     event_type=EventType.EXECUTION,
                     symbol=item.get("symbol", ""),
-                    data=item,
+                    data=NormalizedExecution(
+                        exec_id=item.get("execId", ""),
+                        order_id=item.get("orderId", ""),
+                        symbol=item.get("symbol", ""),
+                        side=Side.BUY if item.get("side") == "Buy" else Side.SELL,
+                        price=float(item.get("execPrice", 0)),
+                        quantity=float(item.get("execQty", 0)),
+                        is_maker=item.get("isMaker", False),
+                        order_type=item.get("orderType", ""),
+                    ),
+                    timestamp=now,
+                ))
+            elif topic == "order":
+                events.append(WsEvent(
+                    event_type=EventType.ORDER,
+                    symbol=item.get("symbol", ""),
+                    data=NormalizedOrderUpdate(
+                        order_id=item.get("orderId", ""),
+                        symbol=item.get("symbol", ""),
+                        status=item.get("orderStatus", ""),
+                        avg_price=float(item.get("avgPrice", 0)),
+                        filled_qty=float(item.get("cumExecQty", 0)),
+                        reduce_only=item.get("reduceOnly", False),
+                        stop_order_type=item.get("stopOrderType", ""),
+                        side=item.get("side", ""),
+                    ),
                     timestamp=now,
                 ))
             elif topic == "position":
                 events.append(WsEvent(
                     event_type=EventType.POSITION,
                     symbol=item.get("symbol", ""),
-                    data=item,
+                    data=NormalizedPositionUpdate(
+                        symbol=item.get("symbol", ""),
+                        size=float(item.get("size", 0)),
+                        entry_price=float(item.get("entryPrice", 0)),
+                        side=item.get("side", ""),
+                    ),
                     timestamp=now,
                 ))
 
@@ -289,7 +315,6 @@ class BybitWS:
         return events
 
     def latency_estimate_ms(self) -> int:
-        """Rough latency estimate from last message timestamps."""
         now = time_now_ms()
         pub_age = now - self._last_pub_msg_ts if self._last_pub_msg_ts > 0 else 999
         return min(pub_age, 999)

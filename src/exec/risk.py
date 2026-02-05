@@ -6,31 +6,64 @@ Key principles:
 - Scale down in high volatility
 - Hard daily loss limit in R-multiples
 - Kill switch on slippage breaches
+- Volatility-adapted stops matching backtest engine
 """
 from __future__ import annotations
 import logging
 from core.types import Side
-from core.utils import clamp, qty_round
+from core.utils import clamp, qty_round, time_now_ms
 from marketdata.book import OrderBook
+from marketdata.tape import TradeTape
 from core.state import RuntimeState
 
 log = logging.getLogger(__name__)
 
 
-def position_size(state: RuntimeState, book: OrderBook, stop_ticks: int,
-                  symbol: str) -> float:
+def estimate_avg_range(tape: TradeTape, tick_size: float,
+                       window_minutes: int = 20) -> float:
+    """Estimate average 1-minute price range from recent trade data.
+
+    Splits the last *window_minutes* of trades into 1-minute buckets,
+    computes high-low per bucket, and returns the mean range.
+    This matches the backtest's per-candle range tracking.
+    """
+    now = time_now_ms()
+    cutoff = now - window_minutes * 60 * 1000
+
+    minute_ranges: dict[int, list[float]] = {}  # minute_key -> [low, high]
+    for t in tape.trades:
+        if t.timestamp < cutoff:
+            continue
+        mk = t.timestamp // 60000
+        if mk not in minute_ranges:
+            minute_ranges[mk] = [t.price, t.price]
+        else:
+            if t.price < minute_ranges[mk][0]:
+                minute_ranges[mk][0] = t.price
+            if t.price > minute_ranges[mk][1]:
+                minute_ranges[mk][1] = t.price
+
+    ranges = [hi - lo for lo, hi in minute_ranges.values() if hi > lo]
+    if ranges:
+        return max(sum(ranges) / len(ranges), tick_size * 5)
+    return tick_size * 30  # safe fallback
+
+
+def position_size(state: RuntimeState, book: OrderBook,
+                  stop_distance: float, symbol: str,
+                  confidence: float = 0.0) -> float:
     """Calculate position size based on risk parameters.
 
-    Size = risk_dollars / (stop_distance_in_price * 1)
-    With adjustments for drawdown tier and volatility.
+    Args:
+        stop_distance: stop-loss distance in price terms (NOT ticks).
+        confidence: entry confidence for optional confidence-scaled sizing.
     """
     config = state.config
     equity = state.equity
-    tick_size = config.get("tick_sizes", {}).get(symbol, 0.01)
     qty_step = config.get("qty_step", {}).get(symbol, 0.001)
     min_qty = config.get("min_qty", {}).get(symbol, 0.001)
 
-    if stop_ticks <= 0 or equity <= 0:
+    if stop_distance <= 0 or equity <= 0:
         return 0.0
 
     # Base risk
@@ -42,28 +75,27 @@ def position_size(state: RuntimeState, book: OrderBook, stop_ticks: int,
     dd_mult = state.size_multiplier()
     risk_dollars *= dd_mult
 
+    # Confidence-scaled sizing (matches backtest when profile active)
+    profile = config.get("profile")
+    if profile and profile.get("conf_scale") and confidence > 0.6:
+        conf_mult = 1.0 + (confidence - 0.6) * 0.5  # 0.6→1.0x, 0.8→1.1x
+        risk_dollars *= min(conf_mult, 1.2)
+
     # Rolling edge check: reduce or skip if recent win rate is poor
     wr = state.rolling_win_rate(20)
     if wr < 0.20:
-        return 0.0  # too many losses — skip entry
+        return 0.0  # too many consecutive losses — sit out
     if wr < 0.30:
         risk_dollars *= 0.5  # halve size on thin edge
 
     if risk_dollars <= 0:
         return 0.0
 
-    # Stop distance in price terms
-    stop_distance = stop_ticks * tick_size
-    if stop_distance <= 0:
-        return 0.0
-
-    # Raw quantity: risk / stop_distance (for linear perps, 1 qty = 1 unit exposure)
+    # Raw quantity: risk / stop_distance
     mid = book.mid_price()
     if mid <= 0:
         return 0.0
 
-    # For USDT linear perps: PnL = qty * price_change
-    # So qty = risk_dollars / stop_distance
     qty = risk_dollars / stop_distance
 
     # Apply leverage cap
@@ -91,8 +123,13 @@ def can_trade(state: RuntimeState, book: OrderBook, symbol: str) -> tuple[bool, 
     if state.has_position(symbol):
         return False, "already_in_position"
 
-    if len(state.active_orders) >= config.get("max_open_orders", 2):
-        return False, "max_open_orders"
+    # Max concurrent positions (from profile or config)
+    profile = config.get("profile")
+    max_pos = config.get("max_open_orders", 2)
+    if profile:
+        max_pos = profile.get("max_positions", max_pos)
+    if state.open_position_count() >= max_pos:
+        return False, "max_positions"
 
     if not book.is_fresh():
         return False, "stale_book"
@@ -120,26 +157,45 @@ def can_trade(state: RuntimeState, book: OrderBook, symbol: str) -> tuple[bool, 
 
 
 def compute_stops(book: OrderBook, direction: int, config: dict,
-                  symbol: str) -> tuple[float, float, float]:
+                  symbol: str, avg_range: float = 0.0) -> tuple[float, float, float]:
     """Compute stop-loss and take-profit prices.
 
-    Returns (stop_price, tp_price, stop_ticks).
+    When a profile is active (config["profile"] exists) and avg_range > 0,
+    uses volatility-adapted stops matching the backtest engine:
+        stop_distance = avg_range * sl_range_mult
+        tp_distance   = avg_range * tp_range_mult
+
+    Otherwise falls back to fixed-tick stops.
+
+    Returns (stop_price, tp_price, stop_distance_in_price).
     """
     tick_size = config.get("tick_sizes", {}).get(symbol, 0.01)
-    base_stop = config.get("base_stop_ticks", 3)
-    tp_mult = config.get("tp_ticks_multiplier", 1.5)
-    tp_ticks = base_stop * tp_mult
-
     mid = book.mid_price()
 
-    if direction == 1:  # long
-        stop_price = mid - base_stop * tick_size
-        tp_price = mid + tp_ticks * tick_size
-    else:  # short
-        stop_price = mid + base_stop * tick_size
-        tp_price = mid - tp_ticks * tick_size
+    profile = config.get("profile")
+    if profile and avg_range > 0:
+        # Volatility-adapted stops — matches BacktestEngine._try_enter()
+        sl_mult = profile.get("sl_range_mult", 0.50)
+        tp_mult = profile.get("tp_range_mult", 1.60)
+        avg_range = max(avg_range, tick_size * 5)
 
-    return round(stop_price, 8), round(tp_price, 8), base_stop
+        stop_distance = avg_range * sl_mult
+        tp_distance = avg_range * tp_mult
+    else:
+        # Fallback: fixed-tick stops (no profile or no range data yet)
+        base_stop = config.get("base_stop_ticks", 3)
+        tp_ticks_mult = config.get("tp_ticks_multiplier", 1.5)
+        stop_distance = base_stop * tick_size
+        tp_distance = base_stop * tp_ticks_mult * tick_size
+
+    if direction == 1:  # long
+        stop_price = mid - stop_distance
+        tp_price = mid + tp_distance
+    else:  # short
+        stop_price = mid + stop_distance
+        tp_price = mid - tp_distance
+
+    return round(stop_price, 8), round(tp_price, 8), stop_distance
 
 
 def check_slippage(expected_price: float, fill_price: float,

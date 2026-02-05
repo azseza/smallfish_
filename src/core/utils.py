@@ -2,8 +2,27 @@ import time
 import math
 from typing import Sequence
 
+# Simulated time for backtesting.  When set, time_now_ms() returns this
+# value instead of the wall clock, making all time-windowed analytics
+# (tape, book, state) work correctly with historical data.
+_sim_time_ms: int | None = None
+
+
+def set_sim_time(ts_ms: int) -> None:
+    """Set simulated time (call per-candle in backtest)."""
+    global _sim_time_ms
+    _sim_time_ms = ts_ms
+
+
+def clear_sim_time() -> None:
+    """Restore wall-clock time (call after backtest)."""
+    global _sim_time_ms
+    _sim_time_ms = None
+
 
 def time_now_ms() -> int:
+    if _sim_time_ms is not None:
+        return _sim_time_ms
     return int(time.time() * 1000)
 
 

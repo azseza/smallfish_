@@ -32,7 +32,8 @@ from core.types import Trade, Side, Position, TradeResult
 from core.state import RuntimeState
 from core.ringbuffer import RingBuffer
 from core.utils import (
-    sigmoid, clamp, ema_update, ema_alpha_seconds, safe_div, tick_round, qty_round, time_now_ms
+    sigmoid, clamp, ema_update, ema_alpha_seconds, safe_div, tick_round, qty_round,
+    time_now_ms, set_sim_time, clear_sim_time,
 )
 from core.profiles import PROFILES
 from marketdata.book import OrderBook
@@ -40,68 +41,25 @@ from marketdata.tape import TradeTape
 import marketdata.features as features
 import signals.fuse as fuse
 import exec.risk as risk
-from marketdata.scanner import scan_top_symbols, apply_specs_to_config
+from marketdata.scanner import apply_specs_to_config
+from gateway.factory import create_rest
 
 log = logging.getLogger("backtest")
 
 
 # ─── Historical Data Download ─────────────────────────────────────────
 
-async def fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> List[dict]:
-    """Download kline data from Bybit public API.
-    Bybit returns klines in REVERSE order (newest first), so we paginate backwards.
+async def fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int,
+                       exchange: str = "bybit") -> List[dict]:
+    """Download kline data via exchange REST adapter.
+
+    Uses a temporary REST client (no auth needed for public klines).
     """
-    url = "https://api.bybit.com/v5/market/kline"
-    all_klines = []
-    cursor_end = end_ms
-
-    async with aiohttp.ClientSession() as session:
-        while cursor_end > start_ms:
-            params = {
-                "category": "linear",
-                "symbol": symbol,
-                "interval": interval,
-                "start": start_ms,
-                "end": cursor_end,
-                "limit": 1000,
-            }
-            async with session.get(url, params=params) as resp:
-                data = await resp.json(content_type=None)
-                klines = data.get("result", {}).get("list", [])
-                if not klines:
-                    break
-
-                for k in klines:
-                    all_klines.append({
-                        "ts": int(k[0]),
-                        "open": float(k[1]),
-                        "high": float(k[2]),
-                        "low": float(k[3]),
-                        "close": float(k[4]),
-                        "volume": float(k[5]),
-                        "turnover": float(k[6]),
-                    })
-
-                # Oldest candle in this batch (last element since reverse order)
-                oldest_ts = int(klines[-1][0])
-                if oldest_ts >= cursor_end:
-                    break  # no progress
-                cursor_end = oldest_ts - 1
-
-                log.info("  ... downloaded to %s (%d candles so far)",
-                         time.strftime("%Y-%m-%d", time.gmtime(oldest_ts / 1000)),
-                         len(all_klines))
-                await asyncio.sleep(0.05)
-
-    # Deduplicate and sort ascending
-    seen = set()
-    unique = []
-    for k in all_klines:
-        if k["ts"] not in seen:
-            seen.add(k["ts"])
-            unique.append(k)
-    unique.sort(key=lambda x: x["ts"])
-    return unique
+    rest = create_rest(exchange, api_key="", api_secret="")
+    try:
+        return await rest.get_klines(symbol, interval, start_ms, end_ms)
+    finally:
+        await rest.close()
 
 
 # ─── Synthetic Book from Kline ─────────────────────────────────────────
@@ -275,6 +233,10 @@ class BacktestEngine:
 
     def process_candle(self, symbol: str, kline: dict, prev_kline: dict) -> None:
         """Process one 1-minute candle through the full signal pipeline."""
+        # Set simulated time so all time-windowed analytics (tape, book,
+        # state) see the correct "now" relative to historical data.
+        set_sim_time(kline["ts"] + 59_999)  # end of the 1-min candle
+
         tick_size = self.config.get("tick_sizes", {}).get(symbol, 0.01)
         book = self.books[symbol]
         tape = self.tapes[symbol]
@@ -651,16 +613,23 @@ class BacktestEngine:
 
 async def run_backtest(symbols: List[str], days: int = 30, equity: float = 50.0,
                        profile: str = "conservative", auto_symbols: int = 0,
-                       show_chart: bool = False):
+                       show_chart: bool = False, exchange: str = "bybit"):
     # Load config
     config_path = os.path.join(os.path.dirname(__file__), "..", "config", "default.yaml")
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
+    exchange = config.get("exchange", exchange)
+
     # Auto-scan for best symbols
     if auto_symbols > 0:
         print(f"\n  Scanning for top {auto_symbols} symbols to scalp...")
-        top = await scan_top_symbols(n=auto_symbols, min_volume_usd=30_000_000)
+        from marketdata.scanner import scan_top_symbols
+        rest = create_rest(exchange, api_key="", api_secret="")
+        try:
+            top = await scan_top_symbols(rest, n=auto_symbols, min_volume_usd=30_000_000)
+        finally:
+            await rest.close()
         if top:
             apply_specs_to_config(config, top)
             symbols = [s["symbol"] for s in top]
@@ -673,13 +642,17 @@ async def run_backtest(symbols: List[str], days: int = 30, equity: float = 50.0,
             print("  Scanner found no symbols, using defaults")
     else:
         # Fetch specs for provided symbols
-        from marketdata.scanner import fetch_instruments
-        specs = await fetch_instruments()
+        rest = create_rest(exchange, api_key="", api_secret="")
+        try:
+            specs_list = await rest.get_instruments()
+        finally:
+            await rest.close()
+        specs = {s.symbol: s for s in specs_list}
         for sym in symbols:
             if sym in specs:
-                config.setdefault("tick_sizes", {})[sym] = specs[sym]["tick_size"]
-                config.setdefault("min_qty", {})[sym] = specs[sym]["min_qty"]
-                config.setdefault("qty_step", {})[sym] = specs[sym]["qty_step"]
+                config.setdefault("tick_sizes", {})[sym] = specs[sym].tick_size
+                config.setdefault("min_qty", {})[sym] = specs[sym].min_qty
+                config.setdefault("qty_step", {})[sym] = specs[sym].qty_step
 
     sym_str = "+".join(symbols)
     log.info("=" * 60)
@@ -694,7 +667,7 @@ async def run_backtest(symbols: List[str], days: int = 30, equity: float = 50.0,
     all_klines: Dict[str, List[dict]] = {}
     for sym in symbols:
         log.info("Downloading %d days of 1-minute klines for %s...", days, sym)
-        klines = await fetch_klines(sym, "1", start_ms, end_ms)
+        klines = await fetch_klines(sym, "1", start_ms, end_ms, exchange=exchange)
         log.info("Downloaded %d candles for %s (%.1f days)", len(klines), sym,
                  len(klines) / 1440 if klines else 0)
         if len(klines) >= 100:
@@ -717,6 +690,7 @@ async def run_backtest(symbols: List[str], days: int = 30, equity: float = 50.0,
     for sym, klines in all_klines.items():
         tick_size = config.get("tick_sizes", {}).get(sym, 0.01)
         for i in range(min(warmup, len(klines))):
+            set_sim_time(klines[i]["ts"] + 59_999)
             prev = klines[i - 1] if i > 0 else None
             book = build_synthetic_book(klines[i], prev, tick_size)
             engine.books[sym].on_snapshot(
@@ -752,7 +726,10 @@ async def run_backtest(symbols: List[str], days: int = 30, equity: float = 50.0,
     # Close any open positions
     for sym, klines in all_klines.items():
         if engine.state.has_position(sym):
+            set_sim_time(klines[-1]["ts"] + 59_999)
             engine.force_close_all(klines[-1])
+
+    clear_sim_time()
 
     report = engine.report()
     print_report(report, symbols, days, equity, profile)
@@ -819,11 +796,14 @@ def print_report(report: dict, symbols: list, days: int, equity: float, profile:
     print(f"    Conf Scale:  {'Yes' if p.get('conf_scale') else 'No'}")
 
 
-async def run_sweep(symbols: List[str], days: int = 30, equity: float = 50.0):
+async def run_sweep(symbols: List[str], days: int = 30, equity: float = 50.0,
+                    exchange: str = "bybit"):
     """Run all profiles and compare results."""
     config_path = os.path.join(os.path.dirname(__file__), "..", "config", "default.yaml")
     with open(config_path) as f:
         base_config = yaml.safe_load(f)
+
+    exchange = base_config.get("exchange", exchange)
 
     # Download data once
     end_ms = int(time.time() * 1000)
@@ -832,7 +812,7 @@ async def run_sweep(symbols: List[str], days: int = 30, equity: float = 50.0):
     all_klines: Dict[str, List[dict]] = {}
     for sym in symbols:
         log.info("Downloading %d days of 1-minute klines for %s...", days, sym)
-        klines = await fetch_klines(sym, "1", start_ms, end_ms)
+        klines = await fetch_klines(sym, "1", start_ms, end_ms, exchange=exchange)
         log.info("Downloaded %d candles for %s", len(klines), sym)
         if len(klines) >= 100:
             all_klines[sym] = klines
@@ -853,6 +833,7 @@ async def run_sweep(symbols: List[str], days: int = 30, equity: float = 50.0):
         for sym, klines in all_klines.items():
             tick_size = config.get("tick_sizes", {}).get(sym, 0.01)
             for i in range(min(warmup, len(klines))):
+                set_sim_time(klines[i]["ts"] + 59_999)
                 prev = klines[i - 1] if i > 0 else None
                 book = build_synthetic_book(klines[i], prev, tick_size)
                 engine.books[sym].on_snapshot(
@@ -883,8 +864,10 @@ async def run_sweep(symbols: List[str], days: int = 30, equity: float = 50.0):
 
         for sym, klines in all_klines.items():
             if engine.state.has_position(sym):
+                set_sim_time(klines[-1]["ts"] + 59_999)
                 engine.force_close_all(klines[-1])
 
+        clear_sim_time()
         report = engine.report()
         results[profile_name] = report
         log.info("Profile %s: return=%.1f%% trades=%d dd=%.1f%%",
@@ -936,26 +919,34 @@ async def run_sweep(symbols: List[str], days: int = 30, equity: float = 50.0):
 
 async def backfill_trades(symbols: list[str], config: dict, days: int = 7,
                            equity: float = 50.0,
-                           profile: str = "aggressive") -> list[TradeResult]:
-    """Run a headless backtest and return TradeResult objects for dashboard seeding.
+                           profile: str = "aggressive") -> Tuple[list[TradeResult], dict]:
+    """Run a headless backtest and return TradeResult objects + report for dashboard.
 
     Downloads historical klines, runs the full signal pipeline, and returns
     completed trades so the live dashboard can display 7D performance on startup.
+    Returns (trades, report_dict).
     """
     import copy
     bt_config = copy.deepcopy(config)
     bt_config["initial_equity"] = equity
 
+    exchange = bt_config.get("exchange", "bybit")
+
     # Ensure tick sizes are available (use config defaults, fetch if missing)
     missing = [s for s in symbols if s not in bt_config.get("tick_sizes", {})]
     if missing:
         try:
-            specs = await fetch_instruments()
+            rest = create_rest(exchange, api_key="", api_secret="")
+            try:
+                specs_list = await rest.get_instruments()
+            finally:
+                await rest.close()
+            specs = {s.symbol: s for s in specs_list}
             for sym in missing:
                 if sym in specs:
-                    bt_config.setdefault("tick_sizes", {})[sym] = specs[sym]["tick_size"]
-                    bt_config.setdefault("min_qty", {})[sym] = specs[sym]["min_qty"]
-                    bt_config.setdefault("qty_step", {})[sym] = specs[sym]["qty_step"]
+                    bt_config.setdefault("tick_sizes", {})[sym] = specs[sym].tick_size
+                    bt_config.setdefault("min_qty", {})[sym] = specs[sym].min_qty
+                    bt_config.setdefault("qty_step", {})[sym] = specs[sym].qty_step
         except Exception as e:
             log.warning("Could not fetch instrument specs: %s", e)
 
@@ -966,7 +957,7 @@ async def backfill_trades(symbols: list[str], config: dict, days: int = 7,
     all_klines: Dict[str, List[dict]] = {}
     for sym in symbols:
         log.info("  Backfill: downloading %dd klines for %s...", days, sym)
-        klines = await fetch_klines(sym, "1", start_ms, end_ms)
+        klines = await fetch_klines(sym, "1", start_ms, end_ms, exchange=exchange)
         if len(klines) >= 100:
             all_klines[sym] = klines
             log.info("  Backfill: %s — %d candles", sym, len(klines))
@@ -974,7 +965,7 @@ async def backfill_trades(symbols: list[str], config: dict, days: int = 7,
             log.warning("  Backfill: %s — not enough data, skipping", sym)
 
     if not all_klines:
-        return []
+        return [], {"error": "No data"}
 
     # Run backtest engine
     engine = BacktestEngine(bt_config, initial_equity=equity, profile=profile)
@@ -986,6 +977,7 @@ async def backfill_trades(symbols: list[str], config: dict, days: int = 7,
     for sym, klines in all_klines.items():
         tick_size = bt_config.get("tick_sizes", {}).get(sym, 0.01)
         for i in range(min(warmup, len(klines))):
+            set_sim_time(klines[i]["ts"] + 59_999)
             prev = klines[i - 1] if i > 0 else None
             book = build_synthetic_book(klines[i], prev, tick_size)
             engine.books[sym].on_snapshot(
@@ -1020,8 +1012,10 @@ async def backfill_trades(symbols: list[str], config: dict, days: int = 7,
     # Close any open positions
     for sym, klines in all_klines.items():
         if engine.state.has_position(sym):
+            set_sim_time(klines[-1]["ts"] + 59_999)
             engine.force_close_all(klines[-1])
 
+    clear_sim_time()
     results = list(engine.state.completed_trades.get())
     report = engine.report()
     log.info("  Backfill complete: %d trades, $%.2f → $%.2f (%+.1f%%), WR %.1f%%",
@@ -1031,7 +1025,7 @@ async def backfill_trades(symbols: list[str], config: dict, days: int = 7,
              report.get("total_return_pct", 0),
              report.get("win_rate", 0))
 
-    return results
+    return results, report
 
 
 if __name__ == "__main__":
@@ -1055,6 +1049,8 @@ if __name__ == "__main__":
                         help="Run all profiles and compare")
     parser.add_argument("--chart", action="store_true",
                         help="Show terminal bar charts (trade PnL, equity curve, signal weights)")
+    parser.add_argument("--exchange", default="bybit", choices=["bybit", "binance"],
+                        help="Exchange to use for data download")
     args = parser.parse_args()
 
     if args.symbols:
@@ -1065,7 +1061,8 @@ if __name__ == "__main__":
         symbols = [args.symbol]
 
     if args.sweep:
-        asyncio.run(run_sweep(symbols, args.days, args.equity))
+        asyncio.run(run_sweep(symbols, args.days, args.equity, exchange=args.exchange))
     else:
         asyncio.run(run_backtest(symbols, args.days, args.equity, args.mode,
-                                  auto_symbols=args.auto, show_chart=args.chart))
+                                  auto_symbols=args.auto, show_chart=args.chart,
+                                  exchange=args.exchange))

@@ -1,102 +1,54 @@
 """Dynamic symbol scanner.
 
-Fetches top USDT perpetual symbols from Bybit ranked by:
+Fetches top USDT perpetual symbols ranked by:
   1. 24h trading volume (liquidity)
   2. 24h price change % (volatility = scalping opportunity)
 
 Also auto-fetches instrument specs (tick_size, min_qty, qty_step).
+Works with any exchange adapter implementing ExchangeREST.
 """
 from __future__ import annotations
 import asyncio
 import logging
 from typing import List, Dict, Optional
 
-import aiohttp
+from gateway.base import ExchangeREST, InstrumentSpec, TickerInfo
 
 log = logging.getLogger(__name__)
 
-BYBIT_BASE = "https://api.bybit.com"
-BYBIT_TESTNET_BASE = "https://api-testnet.bybit.com"
-
-
-async def fetch_tickers(testnet: bool = False) -> List[dict]:
-    """Fetch 24h tickers for all USDT linear perpetuals."""
-    base = BYBIT_TESTNET_BASE if testnet else BYBIT_BASE
-    url = f"{base}/v5/market/tickers"
-    params = {"category": "linear"}
-
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, params=params) as resp:
-            data = await resp.json(content_type=None)
-            tickers = data.get("result", {}).get("list", [])
-            return tickers
-
-
-async def fetch_instruments(testnet: bool = False) -> Dict[str, dict]:
-    """Fetch instrument specs for all USDT linear perpetuals."""
-    base = BYBIT_TESTNET_BASE if testnet else BYBIT_BASE
-    url = f"{base}/v5/market/instruments-info"
-    params = {"category": "linear", "limit": 1000}
-    specs = {}
-
-    async with aiohttp.ClientSession() as session:
-        cursor = ""
-        while True:
-            if cursor:
-                params["cursor"] = cursor
-            async with session.get(url, params=params) as resp:
-                data = await resp.json(content_type=None)
-                items = data.get("result", {}).get("list", [])
-                for item in items:
-                    sym = item.get("symbol", "")
-                    if not sym.endswith("USDT"):
-                        continue
-                    lot = item.get("lotSizeFilter", {})
-                    price = item.get("priceFilter", {})
-                    specs[sym] = {
-                        "symbol": sym,
-                        "tick_size": float(price.get("tickSize", "0.01")),
-                        "min_qty": float(lot.get("minOrderQty", "0.001")),
-                        "qty_step": float(lot.get("qtyStep", "0.001")),
-                        "min_notional": float(lot.get("minNotionalValue", "5")),
-                    }
-                cursor = data.get("result", {}).get("nextPageCursor", "")
-                if not cursor or not items:
-                    break
-
-    return specs
-
 
 async def scan_top_symbols(
+    rest: ExchangeREST,
     n: int = 10,
     min_volume_usd: float = 50_000_000,
     min_price: float = 0.01,
-    testnet: bool = False,
     sort_by: str = "score",
 ) -> List[dict]:
     """Scan and rank top symbols for scalping.
 
     Ranking score = volume_rank * 0.6 + change_rank * 0.4
-    (High volume = good liquidity, high change = good opportunity)
 
     Args:
+        rest: Exchange REST client
         n: Number of top symbols to return
         min_volume_usd: Minimum 24h turnover in USD
         min_price: Minimum last price
-        testnet: Use testnet API
         sort_by: "score" (combined), "volume", or "change"
 
     Returns:
         List of dicts with symbol info, sorted best-first
     """
-    tickers, specs = await asyncio.gather(
-        fetch_tickers(testnet),
-        fetch_instruments(testnet),
+    tickers, specs_list = await asyncio.gather(
+        rest.get_tickers(),
+        rest.get_instruments(),
     )
+
+    # Index specs by symbol
+    specs: Dict[str, InstrumentSpec] = {s.symbol: s for s in specs_list}
 
     candidates = []
     for t in tickers:
-        sym = t.get("symbol", "")
+        sym = t.symbol
         if not sym.endswith("USDT"):
             continue
 
@@ -105,22 +57,21 @@ async def scan_top_symbols(
         if base in ("USDC", "DAI", "TUSD", "BUSD", "FDUSD", "USDD", "PYUSD"):
             continue
         if any(x in base for x in ("1000", "10000", "UP", "DOWN", "BEAR", "BULL")):
-            # Allow 1000-prefixed meme coins (1000PEPE, 1000SHIB etc)
             if base.startswith("1000"):
-                pass  # keep these
+                pass  # keep meme coins
             else:
                 continue
 
-        volume_24h = float(t.get("turnover24h", 0))
-        last_price = float(t.get("lastPrice", 0))
-        change_pct = abs(float(t.get("price24hPcnt", 0))) * 100
+        volume_24h = t.turnover_24h
+        last_price = t.last_price
+        change_pct = abs(t.price_change_pct) * 100
 
         if volume_24h < min_volume_usd:
             continue
         if last_price < min_price:
             continue
 
-        spec = specs.get(sym, {})
+        spec = specs.get(sym)
         if not spec:
             continue
 
@@ -129,10 +80,10 @@ async def scan_top_symbols(
             "last_price": last_price,
             "volume_24h_usd": volume_24h,
             "change_24h_pct": change_pct,
-            "tick_size": spec["tick_size"],
-            "min_qty": spec["min_qty"],
-            "qty_step": spec["qty_step"],
-            "min_notional": spec.get("min_notional", 5),
+            "tick_size": spec.tick_size,
+            "min_qty": spec.min_qty,
+            "qty_step": spec.qty_step,
+            "min_notional": spec.min_notional,
         })
 
     if not candidates:
@@ -181,9 +132,9 @@ def apply_specs_to_config(config: dict, symbols_info: List[dict]) -> None:
         config["qty_step"][sym] = info["qty_step"]
 
 
-async def print_scanner_report(n: int = 20, testnet: bool = False):
+async def print_scanner_report(rest: ExchangeREST, n: int = 20):
     """Print a formatted scanner report."""
-    symbols = await scan_top_symbols(n=n, testnet=testnet)
+    symbols = await scan_top_symbols(rest, n=n)
 
     print(f"\n{'='*90}")
     print(f"  TOP {len(symbols)} USDT PERPETUALS FOR SCALPING")
@@ -199,10 +150,3 @@ async def print_scanner_report(n: int = 20, testnet: bool = False):
 
     print(f"{'='*90}")
     return symbols
-
-
-if __name__ == "__main__":
-    import sys
-    logging.basicConfig(level=logging.INFO)
-    n = int(sys.argv[1]) if len(sys.argv) > 1 else 20
-    asyncio.run(print_scanner_report(n))

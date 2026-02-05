@@ -1,9 +1,11 @@
-"""Tests for plotext terminal dashboard."""
+"""Tests for rich terminal dashboard."""
 import pytest
 import time
 from unittest.mock import patch
 
-from monitor.dashboard import TerminalDashboard, _ansi_len, _ansi_pad, _pnl_col
+from rich.panel import Panel
+
+from monitor.dashboard import TerminalDashboard
 from core.state import RuntimeState
 from core.types import Side, TradeResult
 
@@ -41,7 +43,7 @@ class TestDashboardInit:
     def test_creates_with_defaults(self, dashboard):
         assert dashboard.enabled is True
         assert dashboard.refresh_s == 1.0
-        assert len(dashboard._prices) == 0
+        assert len(dashboard._candles) == 0
         assert len(dashboard._equity_history) == 0
 
     def test_disabled_by_default(self, state, config):
@@ -51,33 +53,40 @@ class TestDashboardInit:
 
 
 class TestPriceData:
-    def test_add_price_point(self, dashboard):
+    def test_add_price_point_creates_candle(self, dashboard):
         dashboard.add_price_point(50000.0)
         dashboard.add_price_point(50001.0)
-        assert len(dashboard._prices) == 2
-        assert dashboard._prices[-1] == 50001.0
+        assert dashboard._current_candle is not None
+        assert dashboard._current_candle.close == 50001.0
+        assert dashboard._current_candle.volume == 2
 
-    def test_price_buffer_bounded(self, dashboard):
-        for i in range(400):
-            dashboard.add_price_point(50000.0 + i)
-        assert len(dashboard._prices) <= 300
+    def test_candle_ohlc_correct(self, dashboard):
+        dashboard.add_price_point(100.0)
+        dashboard.add_price_point(105.0)
+        dashboard.add_price_point(98.0)
+        dashboard.add_price_point(102.0)
+        c = dashboard._current_candle
+        assert c.open == 100.0
+        assert c.high == 105.0
+        assert c.low == 98.0
+        assert c.close == 102.0
 
     def test_add_order_marker_buy(self, dashboard):
         dashboard.add_price_point(50000.0)
         dashboard.add_order_marker("BUY", 50000.0)
-        assert len(dashboard._buy_markers_x) == 1
-        assert dashboard._buy_markers_y[0] == 50000.0
+        assert len(dashboard._buy_markers) == 1
+        assert dashboard._buy_markers[0][1] == 50000.0
 
     def test_add_order_marker_sell(self, dashboard):
         dashboard.add_price_point(50000.0)
         dashboard.add_order_marker("SELL", 49999.0)
-        assert len(dashboard._sell_markers_x) == 1
-        assert dashboard._sell_markers_y[0] == 49999.0
+        assert len(dashboard._sell_markers) == 1
+        assert dashboard._sell_markers[0][1] == 49999.0
 
     def test_order_markers_bounded(self, dashboard):
-        for i in range(250):
+        for i in range(150):
             dashboard.add_order_marker("BUY", 50000.0 + i)
-        assert len(dashboard._buy_markers_x) <= 200
+        assert len(dashboard._buy_markers) <= 100
 
 
 class TestEquitySnapshot:
@@ -92,57 +101,31 @@ class TestEquitySnapshot:
         assert len(dashboard._equity_history) <= 200
 
 
-class TestAnsiHelpers:
-    def test_ansi_len_plain(self):
-        assert _ansi_len("hello") == 5
-
-    def test_ansi_len_with_codes(self):
-        colored = "\033[32mhello\033[0m"
-        assert _ansi_len(colored) == 5
-
-    def test_ansi_pad_plain(self):
-        assert _ansi_pad("hi", 5) == "hi   "
-
-    def test_ansi_pad_colored(self):
-        colored = "\033[31mhi\033[0m"
-        padded = _ansi_pad(colored, 5)
-        assert _ansi_len(padded) == 5
-
-    def test_ansi_pad_already_wide(self):
-        result = _ansi_pad("hello", 3)
-        assert result == "hello"
-
-    def test_pnl_col_positive(self):
-        result = _pnl_col(1.0, "+$1.00")
-        assert "\033[32m" in result  # green
-
-    def test_pnl_col_negative(self):
-        result = _pnl_col(-1.0, "-$1.00")
-        assert "\033[31m" in result  # red
+class TestStatusPanel:
+    def test_returns_panel(self, dashboard):
+        panel = dashboard._build_status_panel()
+        assert isinstance(panel, Panel)
+        assert "SMALLFISH" in panel.title
 
 
-class TestLeftPanel:
-    def test_build_left_lines_returns_correct_height(self, dashboard):
-        lines = dashboard._build_left_lines(40, 30)
-        assert len(lines) == 30
+class TestStatsPanel:
+    def test_returns_panel(self, dashboard):
+        panel = dashboard._build_stats_panel()
+        assert isinstance(panel, Panel)
+        assert "METRICS" in panel.title
 
-    def test_build_left_lines_correct_width(self, dashboard):
-        lines = dashboard._build_left_lines(40, 20)
-        for line in lines:
-            assert _ansi_len(line) == 40
-
-    def test_left_panel_shows_equity(self, dashboard):
-        lines = dashboard._build_left_lines(40, 30)
-        joined = "\n".join(lines)
-        assert "1050.00" in joined
-
-    def test_left_panel_shows_profile(self, dashboard, config):
+    def test_panel_shows_metrics(self, dashboard, config):
         config["profile"] = {"name": "aggressive"}
-        lines = dashboard._build_left_lines(40, 30)
-        joined = "\n".join(lines)
-        assert "AGGRESSIVE" in joined
+        panel = dashboard._build_stats_panel()
+        assert isinstance(panel, Panel)
 
-    def test_left_panel_shows_trades(self, dashboard, state):
+
+class TestTradesPanel:
+    def test_returns_panel_empty(self, dashboard):
+        panel = dashboard._build_trades_panel()
+        assert isinstance(panel, Panel)
+
+    def test_returns_panel_with_trades(self, dashboard, state):
         now_ms = int(time.time() * 1000)
         trade = TradeResult(
             symbol="BTCUSDT", side=Side.BUY,
@@ -153,9 +136,8 @@ class TestLeftPanel:
             slippage_exit=0.0, exit_reason="tp",
         )
         state.completed_trades.append(trade)
-        lines = dashboard._build_left_lines(40, 40)
-        joined = "\n".join(lines)
-        assert "BTCUSD" in joined
+        panel = dashboard._build_trades_panel()
+        assert isinstance(panel, Panel)
 
 
 class TestSevenDayPerf:
@@ -178,9 +160,24 @@ class TestSevenDayPerf:
             state.completed_trades.append(trade)
         result = dashboard._calc_7d()
         assert len(result) >= 1
-        # Check today has trades
         label, pnl, wins, losses = result[-1]
         assert wins + losses == 5
+
+
+class TestCandlePanel:
+    def test_returns_panel_waiting(self, dashboard):
+        panel = dashboard._build_candle_panel()
+        assert isinstance(panel, Panel)
+
+    def test_returns_panel_with_data(self, dashboard):
+        # Simulate enough ticks for at least 2 candles
+        from monitor.dashboard import OHLCCandle
+        dashboard._candles.append(
+            OHLCCandle(ts=1000, open=100, high=105, low=98, close=102, volume=10))
+        dashboard._candles.append(
+            OHLCCandle(ts=1060, open=102, high=108, low=101, close=106, volume=15))
+        panel = dashboard._build_candle_panel()
+        assert isinstance(panel, Panel)
 
 
 class TestStaticRenderers:

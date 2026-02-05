@@ -141,6 +141,41 @@ class WsEvent:
 
 
 @dataclass(slots=True)
+class NormalizedExecution:
+    """Exchange-agnostic execution (fill) event."""
+    exec_id: str = ""
+    order_id: str = ""
+    symbol: str = ""
+    side: Side = Side.BUY
+    price: float = 0.0
+    quantity: float = 0.0
+    is_maker: bool = False
+    order_type: str = ""
+
+
+@dataclass(slots=True)
+class NormalizedOrderUpdate:
+    """Exchange-agnostic order status update."""
+    order_id: str = ""
+    symbol: str = ""
+    status: str = ""
+    avg_price: float = 0.0
+    filled_qty: float = 0.0
+    reduce_only: bool = False
+    stop_order_type: str = ""
+    side: str = ""
+
+
+@dataclass(slots=True)
+class NormalizedPositionUpdate:
+    """Exchange-agnostic position update."""
+    symbol: str = ""
+    size: float = 0.0
+    entry_price: float = 0.0
+    side: str = ""
+
+
+@dataclass(slots=True)
 class TradeResult:
     """Result of a completed round-trip trade."""
     symbol: str

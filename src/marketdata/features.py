@@ -167,6 +167,78 @@ def vol_regime(tape: TradeTape, config: dict) -> Dict[str, float]:
     }
 
 
+def cvd_features(tape: TradeTape, book: OrderBook, config: dict) -> Dict[str, float]:
+    """CVD (Cumulative Volume Delta) features — flow confirmation + divergence."""
+    micro_cfg = config.get("microstructure", {})
+    window_ms = micro_cfg.get("cvd_window_ms", 5000)
+
+    cvd = tape.cvd_in_window(window_ms)
+    total_vol = tape.volume_in_window(window_ms)
+    cvd_norm = safe_div(cvd, max(total_vol, 1e-12))
+    cvd_accel = tape.cvd_acceleration(window_ms)
+
+    # CVD divergence: price going one way, CVD going the other
+    # +1 = bullish divergence (price down but CVD up)
+    # -1 = bearish divergence (price up but CVD down)
+    mid_change = book.mid_change_ticks(window_ms)
+    if mid_change < -0.5 and cvd_norm > 0.1:
+        cvd_divergence = 1.0   # bullish: price down but buyers dominating
+    elif mid_change > 0.5 and cvd_norm < -0.1:
+        cvd_divergence = -1.0  # bearish: price up but sellers dominating
+    else:
+        cvd_divergence = 0.0
+
+    return {
+        "cvd": cvd,
+        "cvd_norm": cvd_norm,
+        "cvd_accel": cvd_accel,
+        "cvd_divergence": cvd_divergence,
+    }
+
+
+def microstructure_features(tape: TradeTape, book: OrderBook, config: dict) -> Dict[str, float]:
+    """Microstructure features: trade intensity, liquidity, micro vol ratio, absorption."""
+    micro_cfg = config.get("microstructure", {})
+
+    # TPS: trade intensity ratio (short window / baseline)
+    tps_window = micro_cfg.get("tps_window_ms", 1000)
+    tps_baseline = micro_cfg.get("tps_baseline_ms", 30000)
+    rate_short = tape.trade_rate(tps_window)
+    rate_long = tape.trade_rate(tps_baseline)
+    tps_ratio = safe_div(rate_short, max(rate_long, 1e-6), 1.0)
+
+    # LIQ: liquidity depth within N ticks of BBO
+    liq_ticks = micro_cfg.get("liq_depth_ticks", 10)
+    liq_bid = book.cumulative_depth("bid", liq_ticks)
+    liq_ask = book.cumulative_depth("ask", liq_ticks)
+    liq_total = liq_bid + liq_ask
+    liq_thinness = safe_div(1.0, max(liq_total, 1e-12))
+    liq_asymmetry = safe_div(liq_bid - liq_ask, max(liq_total, 1e-12))
+
+    # MVR: micro volatility ratio (RV_short / RV_long)
+    mvr_short_s = micro_cfg.get("mvr_short_s", 2)
+    mvr_long_s = micro_cfg.get("mvr_long_s", 30)
+    rv_short = tape.realized_vol(lookback_s=mvr_short_s)
+    rv_long = tape.realized_vol(lookback_s=mvr_long_s)
+    mvr = safe_div(rv_short, max(rv_long, 1e-9), 1.0)
+
+    # ABS: absorption — aggressive volume that didn't move price
+    abs_window = micro_cfg.get("absorption_window_ms", 3000)
+    total_aggressive_vol = tape.volume_in_window(abs_window)
+    mid_change_abs = abs(book.mid_change_ticks(abs_window))
+    absorption = safe_div(total_aggressive_vol, max(mid_change_abs, 1e-6))
+
+    return {
+        "tps_ratio": tps_ratio,
+        "liq_bid": liq_bid,
+        "liq_ask": liq_ask,
+        "liq_thinness": liq_thinness,
+        "liq_asymmetry": liq_asymmetry,
+        "mvr": mvr,
+        "absorption": absorption,
+    }
+
+
 def compute_all(book: OrderBook, tape: TradeTape, config: dict) -> Dict[str, float]:
     """Compute all features in a single pass."""
     f: Dict[str, float] = {}
@@ -176,4 +248,6 @@ def compute_all(book: OrderBook, tape: TradeTape, config: dict) -> Dict[str, flo
     f.update(whales(tape, book, config))
     f.update(vwap_features(tape, book, config))
     f.update(vol_regime(tape, config))
+    f.update(cvd_features(tape, book, config))
+    f.update(microstructure_features(tape, book, config))
     return f

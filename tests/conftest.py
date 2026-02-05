@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 @pytest.fixture
 def config():
     return {
+        "exchange": "bybit",
         "symbols": ["BTCUSDT"],
         "tick_sizes": {"BTCUSDT": 0.10, "ETHUSDT": 0.01},
         "min_qty": {"BTCUSDT": 0.001, "ETHUSDT": 0.01},
@@ -43,9 +44,19 @@ def config():
         "ioc_pmin": 0.65,
         "max_reprice_attempts": 3,
         "weights": {
-            "w": [0.30, 0.15, 0.20],
-            "v": [0.12, 0.08, 0.05],
-            "x": [0.07, 0.03],
+            "w": [0.22, 0.10, 0.15],
+            "v": [0.08, 0.05, 0.03],
+            "x": [0.05, 0.02],
+            "t": [0.07, 0.05, 0.06, 0.06, 0.06],
+        },
+        "microstructure": {
+            "cvd_window_ms": 5000,
+            "tps_window_ms": 1000,
+            "tps_baseline_ms": 30000,
+            "liq_depth_ticks": 10,
+            "mvr_short_s": 2,
+            "mvr_long_s": 30,
+            "absorption_window_ms": 3000,
         },
         "vol_regime": {
             "lookback_s": 60,

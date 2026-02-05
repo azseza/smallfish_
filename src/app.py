@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 
 import yaml
 from dotenv import load_dotenv
@@ -32,8 +33,7 @@ from exec.router import OrderRouter
 from exec.oco import OcoManager
 import exec.risk as risk
 
-from gateway.bybit_ws import BybitWS
-from gateway.rest import BybitREST
+from gateway.factory import create_rest, create_ws
 from gateway.persistence import Persistence
 
 from monitor.heartbeat import Heartbeat
@@ -93,18 +93,28 @@ async def main() -> None:
 
     profile_label = args.mode.upper() if args.mode else "DEFAULT"
 
+    exchange = config.get("exchange", "bybit").lower()
+
+    if exchange == "binance":
+        api_key = os.environ.get("BINANCE_API_KEY", "")
+        api_secret = os.environ.get("BINANCE_API_SECRET", "")
+        testnet = os.environ.get("BINANCE_TESTNET", "false").lower() == "true"
+        env_label = "BINANCE_API_KEY / BINANCE_API_SECRET"
+    else:
+        api_key = os.environ.get("BYBIT_API_KEY", "")
+        api_secret = os.environ.get("BYBIT_API_SECRET", "")
+        testnet = os.environ.get("BYBIT_TESTNET", "false").lower() == "true"
+        env_label = "BYBIT_API_KEY / BYBIT_API_SECRET"
+
     log.info("=" * 60)
     log.info("  ><(((o>  SMALLFISH v2.0  <o)))><")
     log.info("  microstructure tools for the small fish")
-    log.info("  profile: %s", profile_label)
+    log.info("  exchange: %s%s  profile: %s",
+             exchange.upper(), " (testnet)" if testnet else "", profile_label)
     log.info("=" * 60)
 
-    api_key = os.environ.get("BYBIT_API_KEY", "")
-    api_secret = os.environ.get("BYBIT_API_SECRET", "")
-    testnet = os.environ.get("BYBIT_TESTNET", "false").lower() == "true"
-
     if not api_key or not api_secret:
-        log.error("Missing BYBIT_API_KEY or BYBIT_API_SECRET in environment")
+        log.error("Missing %s in environment", env_label)
         return
 
     symbols = config.get("symbols", ["BTCUSDT"])
@@ -119,12 +129,17 @@ async def main() -> None:
     if args.email_alerts:
         config.setdefault("email", {})["enabled"] = True
 
+    # --- Initialize Components ---
+    state = RuntimeState(config)
+    persistence = Persistence()
+    rest = create_rest(exchange, api_key, api_secret, testnet=testnet)
+
     # --- Dynamic Symbol Selection ---
     auto_symbols = int(os.environ.get("AUTO_SYMBOLS", "0"))
     if auto_symbols > 0:
         from marketdata.scanner import scan_top_symbols, apply_specs_to_config
-        log.info("Scanning for top %d symbols to trade...", auto_symbols)
-        top = await scan_top_symbols(n=auto_symbols, testnet=testnet)
+        log.info("Scanning for top %d symbols on %s...", auto_symbols, exchange.upper())
+        top = await scan_top_symbols(rest, n=auto_symbols)
         if top:
             apply_specs_to_config(config, top)
             symbols = config["symbols"]
@@ -133,10 +148,6 @@ async def main() -> None:
                          s["symbol"], s["volume_24h_usd"]/1e6, s["change_24h_pct"])
         else:
             log.warning("Scanner returned no symbols, using config defaults")
-
-    # --- Initialize Components ---
-    state = RuntimeState(config)
-    persistence = Persistence()
 
     # One order book and tape per symbol
     books: dict[str, OrderBook] = {}
@@ -149,13 +160,12 @@ async def main() -> None:
             tick_size=tick_size,
         )
         tapes[sym] = TradeTape(capacity=5000)
-
-    rest = BybitREST(api_key, api_secret, testnet=testnet)
     router = OrderRouter(rest, config)
     oco = OcoManager(rest, config)
     heartbeat = Heartbeat(state, persistence, config)
 
-    ws = BybitWS(
+    ws = create_ws(
+        exchange=exchange,
         symbols=symbols,
         config=config,
         api_key=api_key,
@@ -166,23 +176,22 @@ async def main() -> None:
     # --- Startup: fetch account info and set leverage ---
     try:
         wallet = await rest.get_wallet_balance()
-        coins = wallet.get("result", {}).get("list", [{}])[0].get("coin", [])
-        for coin in coins:
-            if coin.get("coin") == "USDT":
-                equity = float(coin.get("equity", config.get("initial_equity", 1000)))
-                state.equity = equity
-                state.peak_equity = equity
-                state.daily_start_equity = equity
-                log.info("Account equity: $%.2f USDT", equity)
-                break
+        if wallet.equity > 0:
+            state.equity = wallet.equity
+            state.peak_equity = wallet.equity
+            state.daily_start_equity = wallet.equity
+            log.info("Account equity: $%.2f USDT", wallet.equity)
+        else:
+            log.warning("Wallet returned zero equity — check API keys / account type")
 
         leverage = config.get("leverage", 10)
         for sym in symbols:
             result = await rest.set_leverage(sym, leverage)
-            if result.get("retCode") == 0:
+            if result.success:
                 log.info("Leverage set: %s × %d", sym, leverage)
             else:
-                log.info("Leverage OK: %s × %d", sym, leverage)
+                log.info("Leverage OK: %s × %d (already set or error: %s)",
+                         sym, leverage, result.error_msg)
 
         # Latency calibration
         server_time = await rest.get_server_time()
@@ -191,21 +200,33 @@ async def main() -> None:
         log.info("Initial latency: %dms", latency)
 
     except Exception as e:
-        log.error("Startup error: %s", e)
+        log.error("Startup error (equity may be wrong!): %s", e)
+
+    # Equity sync interval (re-fetch wallet balance periodically)
+    _equity_sync_interval_s = config.get("equity_sync_interval_s", 30)
+    _last_equity_sync = time_now_ms()
 
     # --- Optional: Backfill 7D performance ---
+    bt_report = None
     if args.backfill:
-        from backtest import backfill_trades
+        from backtest import backfill_trades, print_report
         bt_profile = args.mode or "aggressive"
+        # Use the real wallet equity (fetched above), not --equity arg
+        bt_equity = state.equity if state.equity > 1 else args.equity
         log.info("Backfilling 7-day performance (profile=%s, equity=$%.2f)...",
-                 bt_profile, args.equity)
-        bt_trades = await backfill_trades(
+                 bt_profile, bt_equity)
+        bt_trades, bt_report = await backfill_trades(
             symbols, config, days=7,
-            equity=args.equity, profile=bt_profile,
+            equity=bt_equity, profile=bt_profile,
         )
         for t in bt_trades:
             state.completed_trades.append(t)
         log.info("Backfilled %d trades into dashboard 7D history", len(bt_trades))
+
+        # Print explicit backtest results before dashboard takes over stdout
+        if bt_report and "error" not in bt_report:
+            print_report(bt_report, symbols, 7, bt_equity, bt_profile)
+            input("\n  Press Enter to launch dashboard...")
 
     # --- Optional: Multigrid Strategy ---
     grid = None
@@ -223,6 +244,30 @@ async def main() -> None:
         from monitor.dashboard import TerminalDashboard
         dashboard = TerminalDashboard(state, config, grid_strategy=grid)
         dashboard.enabled = True
+
+        # Pre-fill candle chart with recent klines (2h of 1m candles)
+        try:
+            from backtest import fetch_klines
+            end_ms = int(time.time() * 1000)
+            start_ms = end_ms - 2 * 3600 * 1000  # last 2 hours
+            primary_sym = symbols[0] if symbols else "BTCUSDT"
+            recent_klines = await fetch_klines(primary_sym, "1", start_ms, end_ms,
+                                                exchange=exchange)
+            if recent_klines:
+                dashboard.load_historical_candles(recent_klines)
+                log.info("Dashboard: loaded %d historical candles for %s",
+                         len(recent_klines), primary_sym)
+        except Exception as e:
+            log.warning("Dashboard: could not load historical candles: %s", e)
+
+        # Pass 7D backtest ROI to dashboard
+        if bt_report and "error" not in bt_report:
+            dashboard.set_backfill_roi(
+                roi_pct=bt_report.get("total_return_pct", 0),
+                trade_count=bt_report.get("total_trades", 0),
+                win_rate=bt_report.get("win_rate", 0),
+            )
+
         log.info("Terminal dashboard enabled")
 
     # --- Optional: Telegram Bot ---
@@ -299,6 +344,24 @@ async def main() -> None:
             state.update_latency(ws.latency_estimate_ms())
             heartbeat.check()
             persistence.flush_if_needed()
+
+            # 5b. Periodic equity sync from exchange
+            now_ms = time_now_ms()
+            if now_ms - _last_equity_sync > _equity_sync_interval_s * 1000:
+                _last_equity_sync = now_ms
+                try:
+                    wallet = await rest.get_wallet_balance()
+                    if wallet.equity > 0:
+                        old_eq = state.equity
+                        state.equity = wallet.equity
+                        if wallet.equity > state.peak_equity:
+                            state.peak_equity = wallet.equity
+                        drift = wallet.equity - old_eq
+                        if abs(drift) > 0.001:
+                            log.debug("Equity synced: $%.2f -> $%.2f (drift $%+.4f)",
+                                      old_eq, wallet.equity, drift)
+                except Exception:
+                    pass  # non-critical; will retry next interval
 
             # 6. Remote alerts on kill switch
             if state.kill_switch:
@@ -384,15 +447,13 @@ async def process_public_event(
             data.get("a", []),
             data.get("seq", 0),
         )
-        # Feed mid-price to dashboard
-        if dashboard and book.is_fresh():
-            mid = book.mid_price()
-            if mid > 0:
-                dashboard.add_price_point(mid)
 
     elif evt.event_type == EventType.TRADE:
         trade: Trade = evt.data
         tape.add_trade(trade)
+        # Feed trade price to dashboard (builds real OHLCV candles)
+        if dashboard:
+            dashboard.add_price_point(trade.price, trade.quantity)
 
     # --- Signal Pipeline (runs on every book delta and trade) ---
     if not book.is_fresh():
@@ -470,18 +531,22 @@ async def try_enter(
 ) -> None:
     """Attempt to enter a trade."""
     side = Side.BUY if direction == 1 else Side.SELL
+    tick_size = config.get("tick_sizes", {}).get(symbol, 0.01)
 
-    # Compute stops
-    stop_price, tp_price, stop_ticks = risk.compute_stops(book, direction, config, symbol)
+    # Compute volatility-adapted stops (matches backtest engine)
+    avg_range = risk.estimate_avg_range(tape, tick_size)
+    stop_price, tp_price, stop_distance = risk.compute_stops(
+        book, direction, config, symbol, avg_range=avg_range)
 
-    # Position size
-    qty = risk.position_size(state, book, stop_ticks, symbol)
+    # Position size using price-based stop distance + confidence scaling
+    qty = risk.position_size(state, book, stop_distance, symbol,
+                             confidence=confidence)
     if qty <= 0:
         log.debug("Position size too small, skipping entry")
         return
 
-    log.info("ENTRY SIGNAL: %s %s conf=%.3f raw=%.4f qty=%.6f stop=%.2f tp=%.2f",
-             side.name, symbol, confidence, state.last_raw, qty, stop_price, tp_price)
+    log.info("ENTRY SIGNAL: %s %s conf=%.3f raw=%.4f qty=%.6f stop=%.2f tp=%.2f range=%.2f",
+             side.name, symbol, confidence, state.last_raw, qty, stop_price, tp_price, avg_range)
 
     # Try post-only limit
     order_id = await router.enter(symbol, side, qty, book)
@@ -640,7 +705,10 @@ async def manage_position(
     oco: OcoManager,
     persistence: Persistence,
 ) -> None:
-    """Manage an open position: trail stop, check confidence exit."""
+    """Manage an open position: max_hold, trail stop, check confidence exit.
+
+    Matches backtest engine logic: volatility-adapted trailing, max_hold exit.
+    """
     pos = state.position(symbol)
     if not pos:
         return
@@ -652,8 +720,35 @@ async def manage_position(
     # Mark to market
     pos.mark_to_market(current_price)
 
-    # Trail stop if confidence is high
-    await oco.update_trailing(pos, current_price, state.last_confidence)
+    # Max hold enforcement (matches backtest _manage_position)
+    profile = config.get("profile")
+    if profile:
+        max_hold_ms = profile.get("max_hold", 12) * 60_000  # candles → ms
+        hold_duration = time_now_ms() - pos.entry_time
+        if hold_duration >= max_hold_ms:
+            log.info("Max hold reached for %s (%d min), flattening",
+                     symbol, hold_duration // 60_000)
+            await oco.market_flatten(pos)
+            result = state.on_exit(symbol, current_price, "max_hold")
+            if result:
+                persistence.log_trade({
+                    "symbol": symbol,
+                    "side": result.side.name,
+                    "entry_price": result.entry_price,
+                    "exit_price": result.exit_price,
+                    "quantity": result.quantity,
+                    "pnl": round(result.pnl, 6),
+                    "pnl_R": round(result.pnl_R, 4),
+                    "duration_ms": result.duration_ms,
+                    "exit_reason": "max_hold",
+                })
+            return
+
+    # Volatility-adapted trailing (matches backtest trailing logic)
+    tick_size = config.get("tick_sizes", {}).get(symbol, 0.01)
+    avg_range = risk.estimate_avg_range(tape, tick_size)
+    await oco.update_trailing(pos, current_price, state.last_confidence,
+                              avg_range=avg_range)
 
     # Check confidence exit
     should_exit = await oco.tighten_on_confidence_drop(pos, state.last_confidence)

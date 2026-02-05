@@ -1,6 +1,9 @@
 """Tests for feature extraction from market data."""
 import pytest
-from marketdata.features import obi, umom, prt, whales, vwap_features, vol_regime, compute_all
+from marketdata.features import (
+    obi, umom, prt, whales, vwap_features, vol_regime,
+    cvd_features, microstructure_features, compute_all,
+)
 from core.types import Trade, Side
 
 
@@ -84,13 +87,60 @@ class TestVolRegime:
         assert result["vol_regime_name"] in ("low", "normal", "high", "extreme")
 
 
+class TestCvdFeatures:
+    def test_returns_required_keys(self, sample_tape, sample_book, config):
+        result = cvd_features(sample_tape, sample_book, config)
+        assert "cvd" in result
+        assert "cvd_norm" in result
+        assert "cvd_accel" in result
+        assert "cvd_divergence" in result
+
+    def test_cvd_divergence_bounded(self, sample_tape, sample_book, config):
+        result = cvd_features(sample_tape, sample_book, config)
+        assert result["cvd_divergence"] in (-1.0, 0.0, 1.0)
+
+
+class TestMicrostructureFeatures:
+    def test_returns_required_keys(self, sample_tape, sample_book, config):
+        result = microstructure_features(sample_tape, sample_book, config)
+        assert "tps_ratio" in result
+        assert "liq_bid" in result
+        assert "liq_ask" in result
+        assert "liq_thinness" in result
+        assert "liq_asymmetry" in result
+        assert "mvr" in result
+        assert "absorption" in result
+
+    def test_liq_values_non_negative(self, sample_tape, sample_book, config):
+        result = microstructure_features(sample_tape, sample_book, config)
+        assert result["liq_bid"] >= 0
+        assert result["liq_ask"] >= 0
+        assert result["liq_thinness"] >= 0
+
+    def test_tps_ratio_positive(self, sample_tape, sample_book, config):
+        result = microstructure_features(sample_tape, sample_book, config)
+        assert result["tps_ratio"] >= 0
+
+    def test_liq_asymmetry_bounded(self, sample_tape, sample_book, config):
+        result = microstructure_features(sample_tape, sample_book, config)
+        assert -1.0 <= result["liq_asymmetry"] <= 1.0
+
+
 class TestComputeAll:
     def test_computes_all_features(self, sample_book, sample_tape, config):
         result = compute_all(sample_book, sample_tape, config)
-        # Should have features from all modules
+        # Should have features from all modules (original + new)
         assert "obi" in result
         assert "ema_fast" in result
         assert "cancel_rate_ask" in result
         assert "buy_burst" in result
         assert "vwap" in result
         assert "vol_regime" in result
+        # New features
+        assert "cvd" in result
+        assert "cvd_norm" in result
+        assert "cvd_accel" in result
+        assert "tps_ratio" in result
+        assert "liq_thinness" in result
+        assert "mvr" in result
+        assert "absorption" in result

@@ -9,81 +9,90 @@ from __future__ import annotations
 from typing import Dict, Any
 
 PROFILES: Dict[str, Dict[str, Any]] = {
+    # ── Profiles tuned from 7D backtest + corrected param sweep ──────
+    #
+    # Validated findings (BacktestEngine-confirmed):
+    #   - partial_tp=False     (always — cuts avg win in half, kills edge)
+    #   - breakeven_R=999      (disabled — early BE chops winners via noise)
+    #   - sl_range_mult=0.50   (0.30 is too tight for 1m candles, gets whipsawed)
+    #   - tp_range_mult≥1.30   (wider TP lets winners run, improves avg_win/avg_loss)
+    #   - trail_pct=0.20-0.30  (tight trailing, never disabled)
+
     "conservative": {
         "risk_pct": 0.005,       # 0.5% risk per trade
         "max_risk_usd": 5.0,
         "equity_cap_mult": 2,    # cap compounding at 2x initial
-        "sl_range_mult": 0.50,   # SL = 0.5x avg candle range
-        "tp_range_mult": 0.70,   # TP = 0.7x avg range -> R:R = 1.4:1
-        "trail_pct": 0.30,       # trail 30% of range behind peak
+        "sl_range_mult": 0.50,   # proven SL distance for 1m candles
+        "tp_range_mult": 1.30,   # R:R = 2.6:1
+        "trail_pct": 0.30,       # moderate trail
         "cooldown_ms": 60_000,   # 1 minute between entries
         "max_hold": 15,          # 15 candle max hold
         "max_daily_R": 10,       # daily loss limit
         "max_positions": 2,      # max concurrent positions
-        "C_enter": 0.55,
+        "C_enter": 0.58,
         "C_exit": 0.35,
         "alpha": 4,
         "conf_scale": False,     # no confidence-based size scaling
-        "breakeven_R": 999,      # never move to breakeven
-        "partial_tp": False,     # no partial exits
-        "min_signals": 3,        # require 3 signal categories to agree
+        "breakeven_R": 999,      # disabled — let trail do the work
+        "partial_tp": False,     # NEVER — kills edge
+        "min_signals": 5,        # strict filter
     },
     "balanced": {
         "risk_pct": 0.015,       # 1.5% risk per trade
         "max_risk_usd": 20.0,
         "equity_cap_mult": 3,    # moderate compounding
-        "sl_range_mult": 0.50,   # same SL -- don't tighten, it works
-        "tp_range_mult": 1.00,   # wider TP -> R:R = 2:1
+        "sl_range_mult": 0.50,   # proven SL distance
+        "tp_range_mult": 1.60,   # R:R = 3.2:1
         "trail_pct": 0.25,       # tighter trail
         "cooldown_ms": 45_000,   # 45s cooldown
         "max_hold": 12,
-        "max_daily_R": 15,       # higher limit for more risk
-        "max_positions": 3,      # max concurrent positions
-        "C_enter": 0.53,
+        "max_daily_R": 15,
+        "max_positions": 3,
+        "C_enter": 0.55,
         "C_exit": 0.33,
         "alpha": 4,
-        "conf_scale": True,      # scale size with confidence
-        "breakeven_R": 0.8,      # move to BE after 0.8R profit
-        "partial_tp": False,
-        "min_signals": 3,        # require 3 signal categories to agree
+        "conf_scale": True,
+        "breakeven_R": 999,      # disabled
+        "partial_tp": False,     # NEVER
+        "min_signals": 4,        # moderate filter
     },
     "aggressive": {
         "risk_pct": 0.025,       # 2.5% risk per trade
         "max_risk_usd": 40.0,
         "equity_cap_mult": 4,    # compound up to 4x
-        "sl_range_mult": 0.50,   # keep SL same -- proven to work
-        "tp_range_mult": 1.20,   # wide TP -> R:R = 2.4:1
-        "trail_pct": 0.22,       # tighter trail to lock profit
+        "sl_range_mult": 0.50,   # proven SL — R:R = 3.2:1
+        "tp_range_mult": 1.60,   # wider TP than before (was 1.20)
+        "trail_pct": 0.22,       # tight trail to lock profit
         "cooldown_ms": 30_000,   # 30s cooldown
         "max_hold": 12,
-        "max_daily_R": 20,       # high daily allowance
-        "max_positions": 3,      # max concurrent positions
-        "C_enter": 0.52,
+        "max_daily_R": 20,
+        "max_positions": 3,
+        "C_enter": 0.55,
         "C_exit": 0.30,
         "alpha": 4,
         "conf_scale": True,
-        "breakeven_R": 0.7,      # move to BE after 0.7R
-        "partial_tp": True,      # take half at 1R
-        "min_signals": 2,        # require 2 signal categories to agree
+        "breakeven_R": 999,      # disabled — early BE chops winners
+        "partial_tp": False,     # NEVER — was killing edge (-$2.57 avg loss vs $1.74 avg win)
+        "min_signals": 3,        # wide entry
     },
     "ultra": {
         "risk_pct": 0.035,       # 3.5% risk per trade
         "max_risk_usd": 75.0,
         "equity_cap_mult": 6,    # heavy compounding
-        "sl_range_mult": 0.50,   # KEEP SL the same -- no tighter!
-        "tp_range_mult": 1.40,   # very wide TP -> R:R = 2.8:1
-        "trail_pct": 0.20,       # tight trail
+        "sl_range_mult": 0.50,   # proven SL — R:R = 4:1
+        "tp_range_mult": 2.00,   # widest TP
+        "trail_pct": 0.20,       # tightest trail
         "cooldown_ms": 20_000,   # 20s cooldown
         "max_hold": 12,
-        "max_daily_R": 30,       # very high daily allowance
-        "max_positions": 4,      # max concurrent positions
-        "C_enter": 0.50,
+        "max_daily_R": 30,
+        "max_positions": 4,
+        "C_enter": 0.52,
         "C_exit": 0.28,
-        "alpha": 3.5,
+        "alpha": 4,
         "conf_scale": True,
-        "breakeven_R": 0.6,
-        "partial_tp": True,
-        "min_signals": 2,        # require 2 signal categories to agree
+        "breakeven_R": 999,      # disabled
+        "partial_tp": False,     # NEVER
+        "min_signals": 3,        # wide entry
     },
 }
 

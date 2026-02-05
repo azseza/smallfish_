@@ -118,6 +118,36 @@ class TradeTape:
         sell_vol = self.volume_in_window(window_ms, Side.SELL)
         return safe_div(buy_vol, buy_vol + sell_vol, 0.5)
 
+    def cvd_in_window(self, window_ms: int = 5000) -> float:
+        """Cumulative Volume Delta: buy_vol - sell_vol in window."""
+        return (self.volume_in_window(window_ms, Side.BUY)
+                - self.volume_in_window(window_ms, Side.SELL))
+
+    def cvd_acceleration(self, window_ms: int = 5000) -> float:
+        """CVD recent_half - CVD older_half, normalized by total vol.
+
+        Positive = accelerating buy pressure, negative = accelerating sell pressure.
+        """
+        now = time_now_ms()
+        cutoff = now - window_ms
+        midpoint = now - window_ms // 2
+
+        recent_delta = 0.0
+        older_delta = 0.0
+        total_vol = 0.0
+
+        for t in reversed(self.trades.get()):
+            if t.timestamp < cutoff:
+                break
+            sign = 1.0 if t.side == Side.BUY else -1.0
+            total_vol += t.quantity
+            if t.timestamp >= midpoint:
+                recent_delta += sign * t.quantity
+            else:
+                older_delta += sign * t.quantity
+
+        return safe_div(recent_delta - older_delta, max(total_vol, 1e-12))
+
     def median_trade_size(self) -> float:
         sizes = sorted(self._recent_sizes.get())
         if not sizes:

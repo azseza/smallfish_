@@ -64,6 +64,9 @@ class Persistence:
         "umom_long", "umom_short", "ltb_long", "ltb_short",
         "sweep_up", "sweep_down", "ice_long", "ice_short",
         "vwap_long", "vwap_short", "vol_regime",
+        "cvd_long", "cvd_short", "tps_long", "tps_short",
+        "liq_long", "liq_short", "mvr_long", "mvr_short",
+        "absorb_long", "absorb_short",
         "spread_ticks", "mid_price", "action",
     ]
 

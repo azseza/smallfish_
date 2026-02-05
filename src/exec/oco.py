@@ -5,9 +5,9 @@ Manages TP/SL brackets and trailing stops via the Bybit trading-stop API.
 from __future__ import annotations
 import logging
 
-from core.types import Position, Side
+from core.types import Position, Side, OrderType
 from core.utils import tick_round
-from gateway.rest import BybitREST
+from gateway.base import ExchangeREST, OrderResponse
 
 log = logging.getLogger(__name__)
 
@@ -15,7 +15,7 @@ log = logging.getLogger(__name__)
 class OcoManager:
     """Manages TP/SL and trailing stop for open positions."""
 
-    def __init__(self, rest: BybitREST, config: dict):
+    def __init__(self, rest: ExchangeREST, config: dict):
         self.rest = rest
         self.config = config
 
@@ -30,25 +30,23 @@ class OcoManager:
             take_profit=position.tp_price,
             stop_loss=position.stop_price,
         )
-        if result.get("retCode", -1) == 0:
+        if result.success:
             log.info("OCO attached: %s TP=%.2f SL=%.2f",
                      position.symbol, position.tp_price, position.stop_price)
         else:
-            log.error("OCO attach failed: %s", result)
+            log.error("OCO attach failed: code=%d %s", result.error_code, result.error_msg)
 
     async def update_trailing(self, position: Position, current_price: float,
-                              confidence: float) -> None:
-        """Update trailing stop based on current price and confidence.
+                              confidence: float,
+                              avg_range: float = 0.0) -> None:
+        """Update trailing stop based on current price.
 
-        Trailing logic:
-        - Track peak favorable price
-        - When confidence > C_trail, tighten the stop
-        - Trail step = trail_step_ticks * tick_size behind peak
+        When a profile is active and avg_range is provided, uses
+        volatility-adapted trailing (avg_range * trail_pct) matching the
+        backtest engine. Otherwise falls back to fixed-tick trailing.
         """
         config = self.config
         tick_size = config.get("tick_sizes", {}).get(position.symbol, 0.01)
-        trail_step = config.get("trail_step_ticks", 1)
-        c_trail = config.get("C_trail", 0.85)
 
         # Update peak favorable
         if position.side == Side.BUY:
@@ -58,19 +56,26 @@ class OcoManager:
             if position.peak_favorable == 0 or current_price < position.peak_favorable:
                 position.peak_favorable = current_price
 
-        # Only trail when confidence is high
-        if confidence < c_trail:
-            return
+        # Compute trail distance
+        profile = config.get("profile")
+        if profile and avg_range > 0:
+            # Volatility-adapted trailing — matches BacktestEngine._manage_position
+            trail_distance = avg_range * profile.get("trail_pct", 0.25)
+        else:
+            # Fallback: fixed-tick trailing (only when confidence is high)
+            c_trail = config.get("C_trail", 0.85)
+            if confidence < c_trail:
+                return
+            trail_step = config.get("trail_step_ticks", 1)
+            trail_distance = trail_step * tick_size
 
         # Compute new stop
         if position.side == Side.BUY:
-            new_stop = position.peak_favorable - trail_step * tick_size
-            # Only move stop up, never down
+            new_stop = position.peak_favorable - trail_distance
             if new_stop <= position.stop_price:
                 return
         else:
-            new_stop = position.peak_favorable + trail_step * tick_size
-            # Only move stop down (for shorts), never up
+            new_stop = position.peak_favorable + trail_distance
             if new_stop >= position.stop_price:
                 return
 
@@ -81,7 +86,7 @@ class OcoManager:
             symbol=position.symbol,
             stop_loss=new_stop,
         )
-        if result.get("retCode", -1) == 0:
+        if result.success:
             old_stop = position.stop_price
             position.stop_price = new_stop
             position.trail_active = True
@@ -111,12 +116,11 @@ class OcoManager:
             symbol=position.symbol,
             side=close_side,
             qty=position.quantity,
-            order_type="Market",
+            order_type=OrderType.MARKET,
             reduce_only=True,
         )
-        order_id = result.get("result", {}).get("orderId", "")
-        log.info("Market flatten: %s %s qty=%.6f → %s",
-                 close_side.name, position.symbol, position.quantity, order_id)
+        log.info("Market flatten: %s %s qty=%.6f -> %s",
+                 close_side.name, position.symbol, position.quantity, result.order_id)
 
     async def flatten_all(self, positions: dict) -> None:
         """Emergency: flatten all positions."""

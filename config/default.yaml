@@ -3,6 +3,10 @@
 # ><(((o>  microstructure tools for the small fish  <o)))><
 # ============================================================
 
+# --- Exchange ---
+# "bybit" or "binance" (USDT-M Futures)
+exchange: "bybit"
+
 # --- Symbols ---
 # Static defaults — override with AUTO_SYMBOLS=N env var for dynamic selection
 symbols:
@@ -73,7 +77,7 @@ drawdown_tiers:
   - { threshold: 1.00, multiplier: 0.0 }   # >10% DD: stop trading
 
 # --- Signal Agreement ---
-min_signals: 2                       # min signal categories that must agree for entry
+min_signals: 3                       # min signal categories (of 13) that must agree for entry
 
 # --- Entry / Exit Gates ---
 C_enter: 0.65                        # min confidence to enter
@@ -88,11 +92,12 @@ reprice_trigger_ticks: 1             # reprice if BBO moves this far
 ioc_pmin: 0.65                       # min fill prob to use IOC fallback
 max_reprice_attempts: 3              # max reprices before giving up
 
-# --- Signal Weights (w = core, v = whale lens) ---
+# --- Signal Weights (w = core, v = whale lens, t = microstructure) ---
 weights:
-  w: [0.30, 0.15, 0.20]             # OBI, PRT, UMOM
-  v: [0.12, 0.08, 0.05]             # LTB, SWEEP, ICE
-  x: [0.07, 0.03]                   # VWAP_DEV, VOL_REGIME
+  w: [0.22, 0.10, 0.15]             # OBI, PRT, UMOM
+  v: [0.08, 0.05, 0.03]             # LTB, SWEEP, ICE
+  x: [0.05, 0.02]                   # VWAP_DEV, VOL_REGIME
+  t: [0.07, 0.05, 0.06, 0.06, 0.06] # CVD, TPS, LIQ, MVR, ABSORB
 
 # --- Volatility Regime ---
 vol_regime:
@@ -120,6 +125,16 @@ prt:
   cancel_window_ms: 500              # window for cancel rate
   cancel_rate_threshold: 0.6         # activation threshold
   mid_change_max_ticks: 2            # max mid-price move for activation
+
+# --- Microstructure (new signals: CVD, TPS, LIQ, MVR, ABS) ---
+microstructure:
+  cvd_window_ms: 5000                # CVD accumulation window
+  tps_window_ms: 1000                # TPS short window (trade intensity)
+  tps_baseline_ms: 30000             # TPS baseline window
+  liq_depth_ticks: 10                # LIQ depth measurement range
+  mvr_short_s: 2                     # MVR short realized vol window
+  mvr_long_s: 30                     # MVR long realized vol window
+  absorption_window_ms: 3000         # Absorption measurement window
 
 # --- Latency ---
 max_latency_ms: 80                   # won't trade if latency exceeds this
