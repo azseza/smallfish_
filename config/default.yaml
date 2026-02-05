@@ -72,6 +72,9 @@ drawdown_tiers:
   - { threshold: 0.10, multiplier: 0.25 }  # 5-10% DD: quarter size
   - { threshold: 1.00, multiplier: 0.0 }   # >10% DD: stop trading
 
+# --- Signal Agreement ---
+min_signals: 2                       # min signal categories that must agree for entry
+
 # --- Entry / Exit Gates ---
 C_enter: 0.65                        # min confidence to enter
 C_trail: 0.85                        # min confidence to trail stop tighter

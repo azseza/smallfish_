@@ -6,7 +6,7 @@ from core.utils import (
 )
 from core.ringbuffer import RingBuffer
 from core.state import RuntimeState
-from core.types import Side
+from core.types import Side, TradeResult
 
 
 class TestUtils:
@@ -183,3 +183,60 @@ class TestRuntimeState:
         assert "equity" in summary
         assert "win_rate" in summary
         assert "kill_switch" in summary
+
+    def test_rolling_win_rate_not_enough_trades(self, config):
+        """With fewer than n trades, rolling_win_rate returns 1.0 (no restriction)."""
+        state = RuntimeState(config)
+        # Add only 5 trades (less than default n=20)
+        for i in range(5):
+            state.completed_trades.append(TradeResult(
+                symbol="BTCUSDT", side=Side.BUY,
+                entry_price=50000.0, exit_price=50010.0,
+                quantity=0.01, pnl=0.10, pnl_R=1.0,
+                entry_time=0, exit_time=1000,
+                duration_ms=1000, slippage_entry=0, slippage_exit=0,
+                signals_at_entry={}, exit_reason="tp_hit",
+            ))
+        assert state.rolling_win_rate(20) == 1.0
+
+    def test_rolling_win_rate_all_wins(self, config):
+        state = RuntimeState(config)
+        for i in range(20):
+            state.completed_trades.append(TradeResult(
+                symbol="BTCUSDT", side=Side.BUY,
+                entry_price=50000.0, exit_price=50010.0,
+                quantity=0.01, pnl=0.10, pnl_R=1.0,
+                entry_time=0, exit_time=1000,
+                duration_ms=1000, slippage_entry=0, slippage_exit=0,
+                signals_at_entry={}, exit_reason="tp_hit",
+            ))
+        assert state.rolling_win_rate(20) == 1.0
+
+    def test_rolling_win_rate_all_losses(self, config):
+        state = RuntimeState(config)
+        for i in range(20):
+            state.completed_trades.append(TradeResult(
+                symbol="BTCUSDT", side=Side.BUY,
+                entry_price=50000.0, exit_price=49990.0,
+                quantity=0.01, pnl=-0.10, pnl_R=-1.0,
+                entry_time=0, exit_time=1000,
+                duration_ms=1000, slippage_entry=0, slippage_exit=0,
+                signals_at_entry={}, exit_reason="sl_hit",
+            ))
+        assert state.rolling_win_rate(20) == 0.0
+
+    def test_rolling_win_rate_mixed(self, config):
+        state = RuntimeState(config)
+        # 6 wins, 14 losses = 30% WR
+        for i in range(20):
+            pnl = 0.10 if i < 6 else -0.10
+            state.completed_trades.append(TradeResult(
+                symbol="BTCUSDT", side=Side.BUY,
+                entry_price=50000.0,
+                exit_price=50010.0 if pnl > 0 else 49990.0,
+                quantity=0.01, pnl=pnl, pnl_R=1.0 if pnl > 0 else -1.0,
+                entry_time=0, exit_time=1000,
+                duration_ms=1000, slippage_entry=0, slippage_exit=0,
+                signals_at_entry={}, exit_reason="tp_hit",
+            ))
+        assert state.rolling_win_rate(20) == pytest.approx(0.30)

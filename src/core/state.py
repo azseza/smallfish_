@@ -226,6 +226,18 @@ class RuntimeState:
         self.kill_reason = ""
         log.info("Daily state reset. Equity=%.2f", self.equity)
 
+    def rolling_win_rate(self, n: int = 20) -> float:
+        """Return win rate over the last *n* completed trades.
+
+        Returns 1.0 when fewer than *n* trades have been recorded
+        (not enough data to judge).
+        """
+        trades = self.completed_trades.last(n)
+        if len(trades) < n:
+            return 1.0  # not enough data — don't restrict
+        wins = sum(1 for t in trades if t.pnl > 0)
+        return wins / len(trades)
+
     def summary(self) -> dict:
         return {
             "equity": round(self.equity, 2),

@@ -1,10 +1,8 @@
-"""Terminal Dashboard — live bar chart visualization for Smallfish.
+"""Terminal Dashboard — split-panel visualization for Smallfish.
 
-Renders trade PnL, equity curve, signal weights, and grid status as
-terminal bar charts. No external dependencies — pure ANSI terminal
-rendering inspired by termgraph.
-
-Designed for headless Raspberry Pi deployments where you SSH in.
+Layout: vertical split
+  Left panel  (text):   Status, session stats, positions, recent trades, 7D perf
+  Right panel (charts): 2x2 grid — Price, Equity, Trade PnL, Signal strength
 
 Usage:
     dashboard = TerminalDashboard(state, config)
@@ -12,94 +10,62 @@ Usage:
     dashboard.stop()
 """
 from __future__ import annotations
+
 import asyncio
 import logging
 import os
+import re
 import sys
 import time
+from collections import deque
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
+
+import plotext as plt
 
 from core.state import RuntimeState
 from core.types import TradeResult
 
 log = logging.getLogger(__name__)
 
-# ANSI color codes
-RESET = "\033[0m"
-BOLD = "\033[1m"
-DIM = "\033[2m"
-RED = "\033[31m"
-GREEN = "\033[32m"
-YELLOW = "\033[33m"
-BLUE = "\033[34m"
-MAGENTA = "\033[35m"
-CYAN = "\033[36m"
-WHITE = "\033[37m"
-BG_RED = "\033[41m"
-BG_GREEN = "\033[42m"
+# Maximum data points kept in rolling buffers
+_MAX_PRICE_POINTS = 300
+_MAX_EQUITY_POINTS = 200
 
-# Bar characters
-FULL_BLOCK = "\u2588"
-HALF_BLOCK = "\u2584"
-LIGHT_SHADE = "\u2591"
-MED_SHADE = "\u2592"
-DARK_SHADE = "\u2593"
-BAR_H = "\u2501"
-BAR_V = "\u2503"
-CORNER_TL = "\u250f"
-CORNER_TR = "\u2513"
-CORNER_BL = "\u2517"
-CORNER_BR = "\u251b"
-TEE_L = "\u2523"
-TEE_R = "\u252b"
-TEE_T = "\u2533"
-TEE_B = "\u253b"
+# ANSI escape code pattern for visible-length calculation
+_ANSI_RE = re.compile(r'\033\[[0-9;]*m')
+
+# Box-drawing characters
+_H, _V = "\u2500", "\u2502"
+_TL, _TR, _BL, _BR = "\u250c", "\u2510", "\u2514", "\u2518"
+_TT, _BT = "\u252c", "\u2534"
 
 
-def _bar(value: float, max_val: float, width: int = 30, color: str = GREEN) -> str:
-    """Render a horizontal bar."""
-    if max_val <= 0:
-        return ""
-    ratio = min(abs(value) / max_val, 1.0)
-    filled = int(ratio * width)
-    bar_str = FULL_BLOCK * filled + LIGHT_SHADE * (width - filled)
-    return f"{color}{bar_str}{RESET}"
+def _ansi_len(text: str) -> int:
+    """Visible length of text, excluding ANSI escape sequences."""
+    return len(_ANSI_RE.sub("", text))
 
 
-def _pnl_bar(value: float, max_val: float, width: int = 20) -> str:
-    """Render a PnL bar (green for positive, red for negative)."""
-    if max_val <= 0:
-        return " " * width
-    ratio = min(abs(value) / max_val, 1.0)
-    filled = max(1, int(ratio * width))
-    color = GREEN if value >= 0 else RED
-    char = FULL_BLOCK
-    return f"{color}{char * filled}{RESET}{' ' * (width - filled)}"
+def _ansi_pad(text: str, width: int) -> str:
+    """Pad text to *visual* width, accounting for ANSI codes."""
+    pad = width - _ansi_len(text)
+    if pad > 0:
+        return text + " " * pad
+    return text
 
 
-def _sparkline(values: List[float], width: int = 40) -> str:
-    """Render a sparkline from a list of values."""
-    if not values:
-        return ""
-    chars = " " + "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
-    mn = min(values)
-    mx = max(values)
-    rng = mx - mn if mx > mn else 1.0
+def _c(text: str, code: str) -> str:
+    """Wrap *text* with ANSI colour/style *code*."""
+    return f"\033[{code}m{text}\033[0m"
 
-    # Resample to width
-    step = max(1, len(values) // width)
-    sampled = values[::step][:width]
 
-    line = ""
-    for v in sampled:
-        idx = int((v - mn) / rng * 7) + 1
-        idx = min(idx, 8)
-        line += chars[idx]
-    return f"{CYAN}{line}{RESET}"
+def _pnl_col(val: float, text: str) -> str:
+    """Green if non-negative, red if negative."""
+    return _c(text, "32") if val >= 0 else _c(text, "31")
 
 
 class TerminalDashboard:
-    """Async terminal dashboard with bar chart visualizations."""
+    """Async terminal dashboard with split-panel layout."""
 
     def __init__(self, state: RuntimeState, config: dict,
                  grid_strategy=None, refresh_s: float = 2.0):
@@ -111,9 +77,44 @@ class TerminalDashboard:
         self._task: Optional[asyncio.Task] = None
         self._running = False
 
-        # Equity history for sparkline
-        self._equity_history: List[float] = []
-        self._pnl_history: List[float] = []
+        # Rolling price data for price chart
+        self._prices: deque[float] = deque(maxlen=_MAX_PRICE_POINTS)
+        self._price_ts: deque[int] = deque(maxlen=_MAX_PRICE_POINTS)
+
+        # Order markers: (index_approx, price)
+        self._buy_markers_x: list[float] = []
+        self._buy_markers_y: list[float] = []
+        self._sell_markers_x: list[float] = []
+        self._sell_markers_y: list[float] = []
+
+        # Equity history for equity curve
+        self._equity_history: list[float] = []
+
+    # ── Public data-feed methods ──────────────────────────────────
+
+    def add_price_point(self, mid_price: float) -> None:
+        """Feed a new mid-price from a book update."""
+        self._prices.append(mid_price)
+        self._price_ts.append(int(time.time()))
+
+    def add_order_marker(self, side: str, price: float) -> None:
+        """Mark an order on the price chart (side = 'BUY' or 'SELL')."""
+        idx = float(len(self._prices) - 1) if self._prices else 0.0
+        if side.upper() == "BUY":
+            self._buy_markers_x.append(idx)
+            self._buy_markers_y.append(price)
+        else:
+            self._sell_markers_x.append(idx)
+            self._sell_markers_y.append(price)
+        # Keep marker lists bounded
+        if len(self._buy_markers_x) > 200:
+            self._buy_markers_x = self._buy_markers_x[-100:]
+            self._buy_markers_y = self._buy_markers_y[-100:]
+        if len(self._sell_markers_x) > 200:
+            self._sell_markers_x = self._sell_markers_x[-100:]
+            self._sell_markers_y = self._sell_markers_y[-100:]
+
+    # ── Lifecycle ─────────────────────────────────────────────────
 
     def start(self) -> None:
         """Start the dashboard refresh loop."""
@@ -142,239 +143,334 @@ class TerminalDashboard:
     def _record_snapshot(self) -> None:
         """Record current equity for history."""
         self._equity_history.append(self.state.equity)
-        if len(self._equity_history) > 200:
-            self._equity_history = self._equity_history[-200:]
+        if len(self._equity_history) > _MAX_EQUITY_POINTS:
+            self._equity_history = self._equity_history[-_MAX_EQUITY_POINTS:]
 
-    def _render(self) -> None:
-        """Render the full dashboard to terminal."""
-        try:
-            cols = os.get_terminal_size().columns
-        except OSError:
-            cols = 80
-        width = min(cols, 100)
+    # ── Left panel (text summary) ─────────────────────────────────
 
-        lines = []
-        lines.append("")
-        lines.append(self._header(width))
-        lines.append(self._account_section(width))
-        lines.append(self._pnl_section(width))
-        lines.append(self._signals_section(width))
-        lines.append(self._trades_section(width))
-        if self.grid:
-            lines.append(self._grid_section(width))
-        lines.append(self._equity_sparkline(width))
-        lines.append(self._footer(width))
+    def _build_left_lines(self, w: int, h: int) -> list[str]:
+        """Build text summary panel as a list of *w*-wide lines.
 
-        output = "\n".join(lines)
+        Sections: header, today stats, open positions, recent trades,
+        7-day performance.
+        """
+        lines: list[str] = []
 
-        # Clear screen and redraw
-        sys.stdout.write("\033[2J\033[H")
-        sys.stdout.write(output)
-        sys.stdout.flush()
+        def ln(text: str = ""):
+            lines.append(_ansi_pad(text, w))
 
-    def _header(self, w: int) -> str:
-        ts = time.strftime("%H:%M:%S")
-        regime_colors = {
-            "low": GREEN, "normal": WHITE,
-            "high": YELLOW, "extreme": RED,
-        }
-        rc = regime_colors.get(self.state.vol_regime, WHITE)
-        regime = f"{rc}{self.state.vol_regime}{RESET}"
+        def sep(title: str):
+            ln()
+            bar = _H * max(0, w - len(title) - 4)
+            ln(_c(f"{_H}{_H} {title} {bar}", "1;36"))
 
-        kill = f"{RED}KILLED: {self.state.kill_reason}{RESET}" if self.state.kill_switch else f"{GREEN}LIVE{RESET}"
+        st = self.state
+        cfg = self.config
 
-        header = (
-            f"{BOLD}{CYAN}"
-            f"  ><(((o>  SMALLFISH DASHBOARD  <o)))><"
-            f"{RESET}\n"
-            f"  {DIM}{ts}{RESET}  |  regime: {regime}  |  {kill}  |  "
-            f"latency: {self.state.latency_ms}ms"
-        )
-        return header
+        # ── Header ────────────────────────────────────────────────
+        profile = cfg.get("profile", {}).get("name", "default")
+        status = _c("KILLED", "31") if st.kill_switch else _c("LIVE", "32")
+        regime = _c(st.vol_regime or "normal", "33")
 
-    def _account_section(self, w: int) -> str:
-        s = self.state
-        dd_color = GREEN if s.drawdown < 0.02 else YELLOW if s.drawdown < 0.05 else RED
-        return (
-            f"\n  {BOLD}ACCOUNT{RESET}\n"
-            f"  Equity:    ${s.equity:>10.2f}  |  "
-            f"Peak: ${s.peak_equity:>10.2f}  |  "
-            f"DD: {dd_color}{s.drawdown*100:.2f}%{RESET}"
-        )
+        ln(_c(f" SMALLFISH  [{profile.upper()}]", "1"))
+        ln(f" Status {status}   Regime {regime}   {_c(time.strftime('%H:%M:%S'), '2')}")
+        ln(f" Latency {st.latency_ms}ms  (ema {st.latency_ema:.0f}ms)")
 
-    def _pnl_section(self, w: int) -> str:
-        s = self.state
-        daily_color = GREEN if s.daily_pnl >= 0 else RED
-        total_color = GREEN if s.realized_pnl >= 0 else RED
-        wr = s.win_count / max(s.trade_count, 1) * 100
+        # ── Today ─────────────────────────────────────────────────
+        sep("TODAY")
+        daily = st.daily_pnl
+        daily_pct = daily / max(st.daily_start_equity, 0.01) * 100
+        pnl_s = f"${daily:+.2f} ({daily_pct:+.1f}%)"
+        ln(f"  Equity   ${st.equity:.2f}")
+        ln(f"  PnL      {_pnl_col(daily, pnl_s)}")
 
-        bar_w = 25
-        max_pnl = max(abs(s.daily_pnl), abs(s.realized_pnl), 1.0)
+        tc = st.trade_count
+        wc, lc = st.win_count, st.loss_count
+        wr = wc / max(tc, 1) * 100
+        ln(f"  Trades   {tc}  (W:{wc} L:{lc})")
+        ln(f"  WinRate  {wr:.1f}%")
 
-        return (
-            f"\n  {BOLD}P&L{RESET}\n"
-            f"  Daily:   {daily_color}${s.daily_pnl:>+9.4f}{RESET}  "
-            f"{_pnl_bar(s.daily_pnl, max_pnl, bar_w)}\n"
-            f"  Total:   {total_color}${s.realized_pnl:>+9.4f}{RESET}  "
-            f"{_pnl_bar(s.realized_pnl, max_pnl, bar_w)}\n"
-            f"  Trades:  {s.trade_count:>4d}  |  "
-            f"W/L: {s.win_count}/{s.loss_count}  |  "
-            f"WR: {wr:.1f}%  |  "
-            f"Daily R: {s.daily_loss_R:.1f}/{self.config.get('max_daily_R', 10)}"
-        )
+        dd = st.drawdown * 100
+        mdd = st.max_drawdown * 100
+        ln(f"  DD       {dd:.2f}%  (max {mdd:.2f}%)")
+        ln(f"  Daily R  {st.daily_loss_R:.1f}R / {cfg.get('max_daily_R', 10)}R")
 
-    def _signals_section(self, w: int) -> str:
+        # Confidence / direction
+        dir_s = {1: _c("LONG", "32"), -1: _c("SHORT", "31")}.get(
+            st.last_direction, _c("FLAT", "2"))
+        ln(f"  Signal   {dir_s}  conf {st.last_confidence:.2f}")
+
+        # ── Open positions ────────────────────────────────────────
+        sep("POSITIONS")
+        if st.positions:
+            for sym, pos in st.positions.items():
+                sd = _c("LONG", "32") if pos.side.value == 1 else _c("SHORT", "31")
+                up = pos.unrealized_pnl
+                ln(f"  {sd} {sym}")
+                ln(f"    qty {pos.quantity:.6f}  @{pos.entry_price:.2f}")
+                up_s = f"${up:+.4f}"
+                ln(f"    uPnL {_pnl_col(up, up_s)}  "
+                   f"SL {pos.stop_price:.2f}  TP {pos.tp_price:.2f}")
+        else:
+            ln(_c("  No open positions", "2"))
+
+        # ── Recent trades ─────────────────────────────────────────
+        sep("RECENT TRADES")
+        completed = list(st.completed_trades.get())
+        if completed:
+            for t in reversed(completed[-8:]):
+                sd = "B" if t.side.value == 1 else "S"
+                sym = t.symbol[:7].ljust(7)
+                r_s = f"{t.pnl_R:+.2f}R".rjust(7)
+                p_s = f"${t.pnl:+.4f}".rjust(10)
+                rsn = _c((t.exit_reason or "")[:6], "2")
+                ln(f"  {sd} {sym} {_pnl_col(t.pnl, r_s)}"
+                   f" {_pnl_col(t.pnl, p_s)} {rsn}")
+        else:
+            ln(_c("  No completed trades", "2"))
+
+        # ── 7-day performance ─────────────────────────────────────
+        sep("7D PERFORMANCE")
+        perf = self._calc_7d()
+        if perf:
+            for label, pnl, wins, losses in perf:
+                ps = f"${pnl:+.2f}".rjust(9)
+                ln(f"  {label}  {_pnl_col(pnl, ps)}  {wins}W/{losses}L")
+            tot_p = sum(p for _, p, _, _ in perf)
+            tot_w = sum(wi for _, _, wi, _ in perf)
+            tot_l = sum(lo for _, _, _, lo in perf)
+            ts = f"${tot_p:+.2f}".rjust(9)
+            ln(f"  {'TOTAL':<6}{_pnl_col(tot_p, ts)}  {tot_w}W/{tot_l}L")
+        else:
+            ln(_c("  No trade history", "2"))
+
+        # Pad remaining lines to fill panel height
+        while len(lines) < h:
+            ln()
+        return lines[:h]
+
+    def _calc_7d(self) -> list[tuple[str, float, int, int]]:
+        """Group completed trades by calendar day for the last 7 days.
+
+        Returns [(day_label, pnl_sum, wins, losses), ...] in
+        chronological order, skipping days with no trades.
+        """
+        completed = list(self.state.completed_trades.get())
+        if not completed:
+            return []
+
+        now = datetime.now(timezone.utc)
+        buckets: dict[str, list[float]] = {}
+        for i in range(7):
+            buckets[(now - timedelta(days=i)).strftime("%m/%d")] = []
+
+        for t in completed:
+            key = datetime.fromtimestamp(
+                t.exit_time / 1000, tz=timezone.utc
+            ).strftime("%m/%d")
+            if key in buckets:
+                buckets[key].append(t.pnl)
+
+        result: list[tuple[str, float, int, int]] = []
+        for i in range(6, -1, -1):
+            key = (now - timedelta(days=i)).strftime("%m/%d")
+            pnls = buckets[key]
+            if pnls:
+                result.append((
+                    key,
+                    sum(pnls),
+                    sum(1 for p in pnls if p >= 0),
+                    sum(1 for p in pnls if p < 0),
+                ))
+        return result
+
+    # ── Right panel (2x2 chart grid) ──────────────────────────────
+
+    def _build_chart_str(self, width: int, height: int) -> str:
+        """Build a 2x2 plotext chart grid and return as a string."""
+        plt.clf()
+        plt.clt()
+        plt.plotsize(width, height)
+        plt.subplots(2, 2)
+
+        self._subplot_price()
+        self._subplot_equity()
+        self._subplot_pnl()
+        self._subplot_signals()
+
+        return plt.build()
+
+    def _subplot_price(self) -> None:
+        """Top-left: price line with buy/sell scatter + position lines."""
+        plt.subplot(1, 1)
+        plt.title("Price")
+        plt.theme("dark")
+
+        prices = list(self._prices)
+        if not prices:
+            plt.scatter([0], [0], marker="dot", label="waiting...")
+            return
+
+        xs = list(range(len(prices)))
+        plt.plot(xs, prices, color="white", label="mid")
+
+        if self._buy_markers_x:
+            bx = [x for x in self._buy_markers_x if x < len(prices)]
+            by = self._buy_markers_y[-len(bx):]
+            if bx:
+                plt.scatter(bx, by, marker="dot", color="green", label="buy")
+
+        if self._sell_markers_x:
+            sx = [x for x in self._sell_markers_x if x < len(prices)]
+            sy = self._sell_markers_y[-len(sx):]
+            if sx:
+                plt.scatter(sx, sy, marker="dot", color="red", label="sell")
+
+        for pos in self.state.positions.values():
+            plt.hline(pos.entry_price, color="cyan")
+            plt.hline(pos.stop_price, color="red")
+            plt.hline(pos.tp_price, color="green")
+
+    def _subplot_equity(self) -> None:
+        """Top-right: equity curve line chart."""
+        plt.subplot(1, 2)
+        plt.title("Equity")
+        plt.theme("dark")
+
+        eq = self._equity_history
+        if len(eq) < 2:
+            plt.scatter([0], [self.state.equity], marker="dot", label="current")
+            return
+
+        xs = list(range(len(eq)))
+        color = "green" if eq[-1] >= eq[0] else "red"
+        plt.plot(xs, eq, color=color, label=f"${eq[-1]:.2f}")
+
+    def _subplot_pnl(self) -> None:
+        """Bottom-left: per-trade PnL bar chart."""
+        plt.subplot(2, 1)
+        plt.title("Trade P&L")
+        plt.theme("dark")
+
+        completed = list(self.state.completed_trades.get())
+        if not completed:
+            plt.scatter([0], [0], marker="dot", label="no trades")
+            return
+
+        recent = completed[-30:]
+        pnls = [t.pnl for t in recent]
+        colors = ["green" if p >= 0 else "red" for p in pnls]
+        plt.bar(list(range(1, len(pnls) + 1)), pnls, color=colors)
+
+    def _subplot_signals(self) -> None:
+        """Bottom-right: signal strength horizontal bars."""
+        plt.subplot(2, 2)
+        plt.title("Signals")
+        plt.theme("dark")
+
         scores = self.state.last_scores
         if not scores:
-            return f"\n  {BOLD}SIGNALS{RESET}\n  {DIM}(waiting for data){RESET}"
+            plt.scatter([0], [0], marker="dot", label="waiting...")
+            return
 
-        signal_names = ["obi", "prt", "umom", "ltb", "sweep", "ice", "vwap_dev", "vol_regime"]
-        bar_w = 20
-        lines = [f"\n  {BOLD}SIGNALS{RESET}  "
-                 f"dir={self.state.last_direction:+d}  "
-                 f"conf={self.state.last_confidence:.3f}"]
-
+        signal_names = ["obi", "prt", "umom", "ltb", "sweep",
+                        "ice", "vwap_dev", "vol_regime"]
+        names = []
+        vals = []
+        colors = []
         for name in signal_names:
-            val = scores.get(name, 0.0)
-            color = GREEN if val > 0 else RED if val < 0 else DIM
-            bar = _bar(abs(val), 1.0, bar_w, color)
-            lines.append(f"  {name:>12s}  {color}{val:>+6.3f}{RESET}  {bar}")
+            v = scores.get(name, 0.0)
+            names.append(name)
+            vals.append(v)
+            colors.append("green" if v > 0 else "red" if v < 0 else "gray")
 
-        return "\n".join(lines)
+        plt.bar(names, vals, color=colors, orientation="horizontal")
 
-    def _trades_section(self, w: int) -> str:
-        trades = list(self.state.completed_trades.get())
-        if not trades:
-            return f"\n  {BOLD}RECENT TRADES{RESET}\n  {DIM}(no trades yet){RESET}"
+    # ── Main render ───────────────────────────────────────────────
 
-        recent = trades[-10:]  # last 10
-        max_pnl = max(abs(t.pnl) for t in recent) if recent else 1.0
-        bar_w = 15
+    def _render(self) -> None:
+        """Render the full split-panel dashboard to terminal."""
+        try:
+            cols = os.get_terminal_size().columns
+            rows = os.get_terminal_size().lines
+        except OSError:
+            cols, rows = 160, 50
 
-        lines = [f"\n  {BOLD}RECENT TRADES{RESET}"]
-        for t in recent:
-            color = GREEN if t.pnl >= 0 else RED
-            side_str = "L" if t.side == 1 else "S"
-            bar = _pnl_bar(t.pnl, max_pnl, bar_w)
-            reason = t.exit_reason[:8] if t.exit_reason else "?"
-            lines.append(
-                f"  {side_str} {t.symbol:<10s} "
-                f"{color}${t.pnl:>+8.4f}{RESET} "
-                f"({t.pnl_R:>+5.2f}R) "
-                f"{bar} "
-                f"{DIM}{reason}{RESET}"
-            )
+        left_w = max(38, cols * 2 // 5)
+        right_w = cols - left_w - 3          # 3 border chars: | | |
+        body_h = max(20, rows - 3)           # top + bottom borders + margin
 
-        return "\n".join(lines)
+        # Build both panels
+        left = self._build_left_lines(left_w, body_h)
 
-    def _grid_section(self, w: int) -> str:
-        if not self.grid:
-            return ""
+        chart_str = self._build_chart_str(right_w, body_h)
+        right = chart_str.split("\n")
+        # Pad / truncate right panel to body_h lines
+        while len(right) < body_h:
+            right.append("")
+        right = right[:body_h]
 
-        all_status = self.grid.all_status()
-        if not any(s.get("active") for s in all_status.values()):
-            return f"\n  {BOLD}MULTIGRID{RESET}\n  {DIM}(inactive){RESET}"
+        # Assemble framed output
+        out: list[str] = []
+        out.append(_TL + _H * left_w + _TT + _H * right_w + _TR)
 
-        lines = [f"\n  {BOLD}MULTIGRID{RESET}"]
-        for sym, gs in all_status.items():
-            if not gs.get("active"):
-                continue
-            lines.append(
-                f"  {sym:<10s}  "
-                f"center={gs['center']:>10.2f}  "
-                f"B:{gs['filled_buys']}/{gs['buy_levels']}  "
-                f"S:{gs['filled_sells']}/{gs['sell_levels']}  "
-                f"pending={gs['pending_orders']}  "
-                f"pnl=${gs['total_pnl']:>+.4f}  "
-                f"trips={gs['round_trips']}"
-            )
+        for i in range(body_h):
+            l_line = _ansi_pad(left[i] if i < len(left) else "", left_w)
+            r_line = _ansi_pad(right[i] if i < len(right) else "", right_w)
+            out.append(f"{_V}{l_line}{_V}{r_line}{_V}")
 
-        return "\n".join(lines)
+        out.append(_BL + _H * left_w + _BT + _H * right_w + _BR)
 
-    def _equity_sparkline(self, w: int) -> str:
-        if len(self._equity_history) < 2:
-            return ""
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.write("\n".join(out))
+        sys.stdout.flush()
 
-        spark = _sparkline(self._equity_history, width=min(w - 20, 60))
-        start = self._equity_history[0]
-        end = self._equity_history[-1]
-        change = end - start
-        color = GREEN if change >= 0 else RED
-
-        return (
-            f"\n  {BOLD}EQUITY{RESET}  "
-            f"${start:.2f} -> ${end:.2f} "
-            f"({color}{change:+.2f}{RESET})\n"
-            f"  {spark}"
-        )
-
-    def _footer(self, w: int) -> str:
-        positions = list(self.state.positions.values())
-        pos_str = ""
-        if positions:
-            parts = []
-            for p in positions:
-                side = "L" if p.side == 1 else "S"
-                color = GREEN if p.unrealized_pnl >= 0 else RED
-                parts.append(
-                    f"{side} {p.symbol} "
-                    f"qty={p.quantity:.4f} "
-                    f"entry={p.entry_price:.2f} "
-                    f"{color}uPnL=${p.unrealized_pnl:+.4f}{RESET}"
-                )
-            pos_str = "\n  ".join(parts)
-
-        if pos_str:
-            return f"\n  {BOLD}POSITIONS{RESET}\n  {pos_str}\n"
-        return f"\n  {DIM}no open positions{RESET}\n"
-
-    # --- One-shot renders for backtest / reporting ---
+    # ── Static one-shot renders for backtest / reporting ──────────
 
     @staticmethod
     def render_backtest_trades(trades: List[dict], width: int = 60) -> str:
-        """Render backtest trade PnL as terminal bar chart."""
+        """Render backtest trade PnL as a plotext bar chart string."""
         if not trades:
             return "  (no trades)"
 
-        pnls = [t["pnl"] for t in trades]
-        max_pnl = max(abs(p) for p in pnls) if pnls else 1.0
-        bar_w = min(width // 2, 25)
+        plt.clf()
+        plt.clt()
+        plt.plotsize(width, 20)
+        plt.title("Trade P&L")
+        plt.theme("dark")
 
-        lines = [f"\n  {BOLD}TRADE P&L CHART{RESET}"]
-        # Show last 30 trades
-        for t in trades[-30:]:
-            color = GREEN if t["pnl"] >= 0 else RED
-            side = t.get("side", "?")[0]
-            sym = t.get("symbol", "?")[:6]
-            bar = _pnl_bar(t["pnl"], max_pnl, bar_w)
-            lines.append(
-                f"  {side} {sym:<6s} {color}${t['pnl']:>+8.4f}{RESET} {bar}"
-            )
+        recent = trades[-30:]
+        pnls = [t["pnl"] for t in recent]
+        colors = ["green" if p >= 0 else "red" for p in pnls]
+        labels = [f"{t.get('side', '?')[0]}{t.get('symbol', '?')[:4]}" for t in recent]
 
-        return "\n".join(lines)
+        plt.bar(labels, pnls, color=colors)
+        return plt.build()
 
     @staticmethod
-    def render_equity_curve(equity_curve: List[Tuple[int, float]], width: int = 60) -> str:
-        """Render equity curve as sparkline."""
+    def render_equity_curve(equity_curve: List[Tuple[int, float]],
+                            width: int = 60) -> str:
+        """Render equity curve as a plotext line chart string."""
         if not equity_curve:
             return ""
-        values = [e for _, e in equity_curve]
-        spark = _sparkline(values, width=min(width, 60))
-        start = values[0]
-        end = values[-1]
-        change = end - start
-        color = GREEN if change >= 0 else RED
 
-        return (
-            f"\n  {BOLD}EQUITY CURVE{RESET}\n"
-            f"  ${start:.2f} -> ${end:.2f} "
-            f"({color}{change:+.2f}{RESET})\n"
-            f"  {spark}\n"
-        )
+        plt.clf()
+        plt.clt()
+        plt.plotsize(width, 15)
+        plt.title("Equity Curve")
+        plt.theme("dark")
+
+        values = [e for _, e in equity_curve]
+        xs = list(range(len(values)))
+        color = "green" if values[-1] >= values[0] else "red"
+        plt.plot(xs, values, color=color,
+                 label=f"${values[0]:.2f} -> ${values[-1]:.2f}")
+
+        return plt.build()
 
     @staticmethod
     def render_signal_weights(config: dict) -> str:
-        """Render signal weights as horizontal bars."""
+        """Render signal weights as a plotext horizontal bar chart string."""
         weights = config.get("weights", {})
         w_vals = weights.get("w", [0.30, 0.15, 0.20])
         v_vals = weights.get("v", [0.12, 0.08, 0.05])
@@ -382,11 +478,12 @@ class TerminalDashboard:
 
         names = ["OBI", "PRT", "UMOM", "LTB", "SWEEP", "ICE", "VWAP", "REGIME"]
         vals = w_vals + v_vals + x_vals
-        max_w = max(vals) if vals else 1.0
 
-        lines = [f"\n  {BOLD}SIGNAL WEIGHTS{RESET}"]
-        for name, val in zip(names, vals):
-            bar = _bar(val, max_w, 20, BLUE)
-            lines.append(f"  {name:>8s}  {val:.0%}  {bar}")
+        plt.clf()
+        plt.clt()
+        plt.plotsize(50, 15)
+        plt.title("Signal Weights")
+        plt.theme("dark")
 
-        return "\n".join(lines)
+        plt.bar(names, vals, color="blue", orientation="horizontal")
+        return plt.build()

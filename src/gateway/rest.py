@@ -18,6 +18,15 @@ from core.utils import time_now_ms
 
 log = logging.getLogger(__name__)
 
+
+def _fmt(value: float) -> str:
+    """Format a float for Bybit API: no scientific notation, no trailing zeros.
+
+    Examples: 8333.0 → "8333", 0.00001 → "0.00001", 1.50 → "1.5"
+    """
+    return f"{value:.10f}".rstrip("0").rstrip(".")
+
+
 BASE_URL = "https://api.bybit.com"
 BASE_URL_TESTNET = "https://api-testnet.bybit.com"
 RECV_WINDOW = "5000"
@@ -67,15 +76,20 @@ class BybitREST:
 
     # --- HTTP helpers ---
 
-    async def _post(self, path: str, payload: dict) -> dict:
+    async def _post(self, path: str, payload: dict, *,
+                    ok_codes: set[int] | None = None) -> dict:
         session = await self._get_session()
         body = orjson.dumps(payload).decode()
         headers = self._auth_headers(body)
         url = f"{self.base_url}{path}"
         async with session.post(url, headers=headers, data=body) as resp:
             data = await resp.json(content_type=None)
-            if data.get("retCode", -1) != 0:
-                log.error("REST POST %s failed: %s", path, data)
+            ret = data.get("retCode", -1)
+            if ret != 0:
+                if ok_codes and ret in ok_codes:
+                    log.debug("REST POST %s: %s", path, data.get("retMsg", ""))
+                else:
+                    log.error("REST POST %s failed: %s", path, data)
             return data
 
     async def _get(self, path: str, params: dict = None) -> dict:
@@ -110,11 +124,11 @@ class BybitREST:
             "symbol": symbol,
             "side": "Buy" if side == Side.BUY else "Sell",
             "orderType": order_type.value,
-            "qty": str(qty),
+            "qty": _fmt(qty),
             "timeInForce": time_in_force.value,
         }
         if price is not None:
-            payload["price"] = str(price)
+            payload["price"] = _fmt(price)
         if reduce_only:
             payload["reduceOnly"] = True
         if close_on_trigger:
@@ -155,9 +169,9 @@ class BybitREST:
             "orderId": order_id,
         }
         if qty is not None:
-            payload["qty"] = str(qty)
+            payload["qty"] = _fmt(qty)
         if price is not None:
-            payload["price"] = str(price)
+            payload["price"] = _fmt(price)
         return await self._post("/v5/order/amend", payload)
 
     # --- Position Management ---
@@ -176,11 +190,11 @@ class BybitREST:
             "positionIdx": position_idx,
         }
         if take_profit is not None:
-            payload["takeProfit"] = str(take_profit)
+            payload["takeProfit"] = _fmt(take_profit)
         if stop_loss is not None:
-            payload["stopLoss"] = str(stop_loss)
+            payload["stopLoss"] = _fmt(stop_loss)
         if trailing_stop is not None:
-            payload["trailingStop"] = str(trailing_stop)
+            payload["trailingStop"] = _fmt(trailing_stop)
         return await self._post("/v5/position/trading-stop", payload)
 
     async def set_leverage(self, symbol: str, leverage: int) -> dict:
@@ -190,7 +204,9 @@ class BybitREST:
             "buyLeverage": str(leverage),
             "sellLeverage": str(leverage),
         }
-        return await self._post("/v5/position/set-leverage", payload)
+        # 110043 = "leverage not modified" — already at the requested value
+        return await self._post("/v5/position/set-leverage", payload,
+                                ok_codes={110043})
 
     # --- Account Info ---
 

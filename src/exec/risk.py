@@ -42,6 +42,13 @@ def position_size(state: RuntimeState, book: OrderBook, stop_ticks: int,
     dd_mult = state.size_multiplier()
     risk_dollars *= dd_mult
 
+    # Rolling edge check: reduce or skip if recent win rate is poor
+    wr = state.rolling_win_rate(20)
+    if wr < 0.20:
+        return 0.0  # too many losses — skip entry
+    if wr < 0.30:
+        risk_dollars *= 0.5  # halve size on thin edge
+
     if risk_dollars <= 0:
         return 0.0
 

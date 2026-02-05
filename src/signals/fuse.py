@@ -138,8 +138,47 @@ def confidence(raw: float, alpha: float, quality_gate: float) -> float:
     return sigmoid(alpha * abs(raw)) * quality_gate
 
 
+def count_agreement(scores: dict, direction: int) -> int:
+    """Count how many of the 8 signal categories agree with the direction.
+
+    Each signal category (obi, prt, umom, ltb, sweep, ice, vwap, regime)
+    counts as agreeing if its score in the given direction exceeds a
+    minimum threshold (0.05).
+    """
+    if direction == 0:
+        return 0
+
+    threshold = 0.05
+
+    if direction == 1:
+        pairs = [
+            scores.get("obi_long", 0.0),
+            scores.get("prt_long", 0.0),
+            scores.get("umom_long", 0.0),
+            scores.get("ltb_long", 0.0),
+            scores.get("sweep_up", 0.0),
+            scores.get("ice_long", 0.0),
+            scores.get("vwap_long", 0.0),
+            scores.get("regime_long", 0.0),
+        ]
+    else:
+        pairs = [
+            scores.get("obi_short", 0.0),
+            scores.get("prt_short", 0.0),
+            scores.get("umom_short", 0.0),
+            scores.get("ltb_short", 0.0),
+            scores.get("sweep_down", 0.0),
+            scores.get("ice_short", 0.0),
+            scores.get("vwap_short", 0.0),
+            scores.get("regime_short", 0.0),
+        ]
+
+    return sum(1 for s in pairs if s > threshold)
+
+
 def decide(scores: dict, weights: dict, alpha: float,
-           quality_gate: float) -> Tuple[int, float, float]:
+           quality_gate: float,
+           min_signals: int = 0) -> Tuple[int, float, float]:
     """Full decision pipeline.
 
     Returns:
@@ -155,5 +194,9 @@ def decide(scores: dict, weights: dict, alpha: float,
 
     direction = 1 if raw > 0 else -1
     conf = confidence(raw, alpha, quality_gate)
+
+    # Signal agreement gate: require min_signals categories to agree
+    if min_signals > 0 and count_agreement(scores, direction) < min_signals:
+        return 0, 0.0, raw
 
     return direction, conf, raw

@@ -1,6 +1,6 @@
 """Tests for signal fusion engine."""
 import pytest
-from signals.fuse import get_weights, meta, confidence, decide, score_all
+from signals.fuse import get_weights, meta, confidence, decide, score_all, count_agreement
 
 
 class TestMeta:
@@ -92,6 +92,115 @@ class TestDecide:
         direction, conf, raw = decide(scores, weights, 5.0, 1.0)
         assert direction == 0
         assert conf == 0.0
+
+
+class TestCountAgreement:
+    def test_all_long_signals_agree(self):
+        scores = {
+            "obi_long": 0.8, "obi_short": 0.0,
+            "prt_long": 0.5, "prt_short": 0.0,
+            "umom_long": 0.6, "umom_short": 0.0,
+            "ltb_long": 0.3, "ltb_short": 0.0,
+            "sweep_up": 0.2, "sweep_down": 0.0,
+            "ice_long": 0.1, "ice_short": 0.0,
+            "vwap_long": 0.4, "vwap_short": 0.0,
+            "regime_long": 0.3, "regime_short": 0.0,
+        }
+        assert count_agreement(scores, 1) == 8
+
+    def test_only_obi_agrees(self):
+        scores = {
+            "obi_long": 0.9, "obi_short": 0.0,
+            "prt_long": 0.0, "prt_short": 0.0,
+            "umom_long": 0.0, "umom_short": 0.0,
+            "ltb_long": 0.0, "ltb_short": 0.0,
+            "sweep_up": 0.0, "sweep_down": 0.0,
+            "ice_long": 0.0, "ice_short": 0.0,
+            "vwap_long": 0.0, "vwap_short": 0.0,
+            "regime_long": 0.0, "regime_short": 0.0,
+        }
+        assert count_agreement(scores, 1) == 1
+
+    def test_short_direction_counts_short_scores(self):
+        scores = {
+            "obi_long": 0.0, "obi_short": 0.8,
+            "prt_long": 0.0, "prt_short": 0.6,
+            "umom_long": 0.0, "umom_short": 0.0,
+            "ltb_long": 0.0, "ltb_short": 0.0,
+            "sweep_up": 0.0, "sweep_down": 0.3,
+            "ice_long": 0.0, "ice_short": 0.0,
+            "vwap_long": 0.0, "vwap_short": 0.0,
+            "regime_long": 0.0, "regime_short": 0.0,
+        }
+        assert count_agreement(scores, -1) == 3
+
+    def test_zero_direction_returns_zero(self):
+        scores = {"obi_long": 0.9}
+        assert count_agreement(scores, 0) == 0
+
+    def test_below_threshold_not_counted(self):
+        scores = {
+            "obi_long": 0.04, "obi_short": 0.0,  # below 0.05 threshold
+            "prt_long": 0.06, "prt_short": 0.0,   # above threshold
+            "umom_long": 0.0, "umom_short": 0.0,
+            "ltb_long": 0.0, "ltb_short": 0.0,
+            "sweep_up": 0.0, "sweep_down": 0.0,
+            "ice_long": 0.0, "ice_short": 0.0,
+            "vwap_long": 0.0, "vwap_short": 0.0,
+            "regime_long": 0.0, "regime_short": 0.0,
+        }
+        assert count_agreement(scores, 1) == 1
+
+
+class TestMinSignals:
+    def test_decide_blocked_by_min_signals(self):
+        """Single strong signal should be blocked when min_signals=3."""
+        scores = {
+            "obi_long": 0.9, "obi_short": 0.0,
+            "prt_long": 0.0, "prt_short": 0.0,
+            "umom_long": 0.0, "umom_short": 0.0,
+            "ltb_long": 0.0, "ltb_short": 0.0,
+            "sweep_up": 0.0, "sweep_down": 0.0,
+            "ice_long": 0.0, "ice_short": 0.0,
+            "vwap_long": 0.0, "vwap_short": 0.0,
+            "regime_long": 0.0, "regime_short": 0.0,
+        }
+        weights = {"w": [0.30, 0.15, 0.20], "v": [0.12, 0.08, 0.05], "x": [0.07, 0.03]}
+        direction, conf, raw = decide(scores, weights, 5.0, 1.0, min_signals=3)
+        assert direction == 0  # blocked: only 1 signal agrees
+
+    def test_decide_passes_with_enough_signals(self):
+        """Three agreeing signals should pass min_signals=3."""
+        scores = {
+            "obi_long": 0.8, "obi_short": 0.0,
+            "prt_long": 0.5, "prt_short": 0.0,
+            "umom_long": 0.6, "umom_short": 0.0,
+            "ltb_long": 0.0, "ltb_short": 0.0,
+            "sweep_up": 0.0, "sweep_down": 0.0,
+            "ice_long": 0.0, "ice_short": 0.0,
+            "vwap_long": 0.0, "vwap_short": 0.0,
+            "regime_long": 0.0, "regime_short": 0.0,
+        }
+        weights = {"w": [0.30, 0.15, 0.20], "v": [0.12, 0.08, 0.05], "x": [0.07, 0.03]}
+        direction, conf, raw = decide(scores, weights, 5.0, 1.0, min_signals=3)
+        assert direction == 1
+        assert conf > 0.5
+
+    def test_decide_no_filter_when_min_signals_zero(self):
+        """min_signals=0 should not filter anything."""
+        scores = {
+            "obi_long": 0.9, "obi_short": 0.0,
+            "prt_long": 0.0, "prt_short": 0.0,
+            "umom_long": 0.0, "umom_short": 0.0,
+            "ltb_long": 0.0, "ltb_short": 0.0,
+            "sweep_up": 0.0, "sweep_down": 0.0,
+            "ice_long": 0.0, "ice_short": 0.0,
+            "vwap_long": 0.0, "vwap_short": 0.0,
+            "regime_long": 0.0, "regime_short": 0.0,
+        }
+        weights = {"w": [0.30, 0.15, 0.20], "v": [0.12, 0.08, 0.05], "x": [0.07, 0.03]}
+        direction, conf, raw = decide(scores, weights, 5.0, 1.0, min_signals=0)
+        assert direction == 1  # should pass — no filter
 
 
 class TestAdaptiveWeights:

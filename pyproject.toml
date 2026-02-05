@@ -15,6 +15,7 @@ orjson = "^3.9"
 python-dotenv = "^1.0"
 python-telegram-bot = "^21.0"
 aiosmtplib = "^3.0"
+plotext = "^5.2"
 
 [tool.poetry.dev-dependencies]
 pytest = "^7.4"

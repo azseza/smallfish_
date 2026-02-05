@@ -20,6 +20,7 @@ from core.types import (
     EventType, Side, Trade, WsEvent, OrderStatus, Position,
 )
 from core.utils import time_now_ms
+from core.profiles import PROFILES, apply_profile
 
 from marketdata.book import OrderBook
 from marketdata.tape import TradeTape
@@ -61,6 +62,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Smallfish — microstructure tools for the small fish"
     )
+    parser.add_argument("--mode",
+                        choices=list(PROFILES),
+                        default=None,
+                        help="Risk profile (conservative/balanced/aggressive/ultra)")
     parser.add_argument("--dashboard", action="store_true",
                         help="Enable terminal dashboard with live bar charts")
     parser.add_argument("--multigrid", action="store_true",
@@ -69,6 +74,10 @@ def parse_args() -> argparse.Namespace:
                         help="Enable Telegram bot for remote control")
     parser.add_argument("--email-alerts", action="store_true",
                         help="Enable email alerts for critical events")
+    parser.add_argument("--backfill", action="store_true",
+                        help="Pre-fill 7D dashboard performance with backtested data")
+    parser.add_argument("--equity", type=float, default=50.0,
+                        help="Equity for backtest backfill (default: $50)")
     return parser.parse_args()
 
 
@@ -78,9 +87,16 @@ async def main() -> None:
     config = load_config()
     setup_logging(config.get("log_level", "INFO"))
 
+    # Apply risk profile if specified
+    if args.mode:
+        apply_profile(config, args.mode)
+
+    profile_label = args.mode.upper() if args.mode else "DEFAULT"
+
     log.info("=" * 60)
     log.info("  ><(((o>  SMALLFISH v2.0  <o)))><")
     log.info("  microstructure tools for the small fish")
+    log.info("  profile: %s", profile_label)
     log.info("=" * 60)
 
     api_key = os.environ.get("BYBIT_API_KEY", "")
@@ -162,8 +178,11 @@ async def main() -> None:
 
         leverage = config.get("leverage", 10)
         for sym in symbols:
-            await rest.set_leverage(sym, leverage)
-            log.info("Leverage set: %s × %d", sym, leverage)
+            result = await rest.set_leverage(sym, leverage)
+            if result.get("retCode") == 0:
+                log.info("Leverage set: %s × %d", sym, leverage)
+            else:
+                log.info("Leverage OK: %s × %d", sym, leverage)
 
         # Latency calibration
         server_time = await rest.get_server_time()
@@ -173,6 +192,20 @@ async def main() -> None:
 
     except Exception as e:
         log.error("Startup error: %s", e)
+
+    # --- Optional: Backfill 7D performance ---
+    if args.backfill:
+        from backtest import backfill_trades
+        bt_profile = args.mode or "aggressive"
+        log.info("Backfilling 7-day performance (profile=%s, equity=$%.2f)...",
+                 bt_profile, args.equity)
+        bt_trades = await backfill_trades(
+            symbols, config, days=7,
+            equity=args.equity, profile=bt_profile,
+        )
+        for t in bt_trades:
+            state.completed_trades.append(t)
+        log.info("Backfilled %d trades into dashboard 7D history", len(bt_trades))
 
     # --- Optional: Multigrid Strategy ---
     grid = None
@@ -228,7 +261,7 @@ async def main() -> None:
             if evt is not None:
                 await process_public_event(evt, books, tapes, state, config,
                                            router, oco, persistence, heartbeat,
-                                           grid=grid)
+                                           grid=grid, dashboard=dashboard)
 
             # 2. Process private events (order fills, position updates)
             for prv_evt in ws.drain_private():
@@ -325,6 +358,7 @@ async def process_public_event(
     persistence: Persistence,
     heartbeat: Heartbeat,
     grid=None,
+    dashboard=None,
 ) -> None:
     """Handle a public WebSocket event: book update or trade."""
     sym = evt.symbol
@@ -350,6 +384,11 @@ async def process_public_event(
             data.get("a", []),
             data.get("seq", 0),
         )
+        # Feed mid-price to dashboard
+        if dashboard and book.is_fresh():
+            mid = book.mid_price()
+            if mid > 0:
+                dashboard.add_price_point(mid)
 
     elif evt.event_type == EventType.TRADE:
         trade: Trade = evt.data
@@ -383,7 +422,10 @@ async def process_public_event(
     weights = fuse.get_weights(config, signal_edges, config.get("adaptive", {}))
 
     # Fuse into decision
-    direction, conf, raw = fuse.decide(scores, weights, config.get("alpha", 5), quality_gate)
+    direction, conf, raw = fuse.decide(
+        scores, weights, config.get("alpha", 5), quality_gate,
+        min_signals=config.get("min_signals", 0),
+    )
     state.last_direction = direction
     state.last_confidence = conf
     state.last_raw = raw
@@ -406,7 +448,8 @@ async def process_public_event(
         if can and state.no_position(sym) and direction != 0 and conf >= config.get("C_enter", 0.65):
             decision_data["action"] = "enter"
             await try_enter(sym, direction, conf, book, tape, state, config,
-                            router, oco, scores, persistence)
+                            router, oco, scores, persistence,
+                            dashboard=dashboard)
 
         persistence.log_decision(decision_data)
 
@@ -423,6 +466,7 @@ async def try_enter(
     oco: OcoManager,
     scores: dict,
     persistence: Persistence,
+    dashboard=None,
 ) -> None:
     """Attempt to enter a trade."""
     side = Side.BUY if direction == 1 else Side.SELL
@@ -464,6 +508,10 @@ async def try_enter(
 
         # Attach TP/SL
         await oco.attach(pos)
+
+        # Mark on dashboard
+        if dashboard:
+            dashboard.add_order_marker(side.name, estimated_price)
 
         # Log order
         persistence.log_order({

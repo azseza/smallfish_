@@ -34,6 +34,7 @@ from core.ringbuffer import RingBuffer
 from core.utils import (
     sigmoid, clamp, ema_update, ema_alpha_seconds, safe_div, tick_round, qty_round, time_now_ms
 )
+from core.profiles import PROFILES
 from marketdata.book import OrderBook
 from marketdata.tape import TradeTape
 import marketdata.features as features
@@ -42,84 +43,6 @@ import exec.risk as risk
 from marketdata.scanner import scan_top_symbols, apply_specs_to_config
 
 log = logging.getLogger("backtest")
-
-
-# ─── Optimization Profiles ──────────────────────────────────────────
-
-PROFILES = {
-    "conservative": {
-        "risk_pct": 0.005,       # 0.5% risk per trade
-        "max_risk_usd": 5.0,
-        "equity_cap_mult": 3,    # cap compounding at 3x initial
-        "sl_range_mult": 0.50,   # SL = 0.5x avg candle range
-        "tp_range_mult": 0.70,   # TP = 0.7x avg range → R:R = 1.4:1
-        "trail_pct": 0.30,       # trail 30% of range behind peak
-        "cooldown_ms": 60_000,   # 1 minute between entries
-        "max_hold": 15,          # 15 candle max hold
-        "max_daily_R": 10,       # daily loss limit
-        "max_positions": 2,      # max concurrent positions
-        "C_enter": 0.55,
-        "C_exit": 0.35,
-        "alpha": 4,
-        "conf_scale": False,     # no confidence-based size scaling
-        "breakeven_R": 999,      # never move to breakeven
-        "partial_tp": False,     # no partial exits
-    },
-    "balanced": {
-        "risk_pct": 0.015,       # 1.5% risk per trade
-        "max_risk_usd": 20.0,
-        "equity_cap_mult": 5,    # moderate compounding
-        "sl_range_mult": 0.50,   # same SL — don't tighten, it works
-        "tp_range_mult": 1.00,   # wider TP → R:R = 2:1
-        "trail_pct": 0.25,       # tighter trail
-        "cooldown_ms": 45_000,   # 45s cooldown
-        "max_hold": 12,
-        "max_daily_R": 15,       # higher limit for more risk
-        "max_positions": 3,      # max concurrent positions
-        "C_enter": 0.53,
-        "C_exit": 0.33,
-        "alpha": 4,
-        "conf_scale": True,      # scale size with confidence
-        "breakeven_R": 0.8,      # move to BE after 0.8R profit
-        "partial_tp": False,
-    },
-    "aggressive": {
-        "risk_pct": 0.025,       # 2.5% risk per trade
-        "max_risk_usd": 40.0,
-        "equity_cap_mult": 8,    # compound up to 8x
-        "sl_range_mult": 0.50,   # keep SL same — proven to work
-        "tp_range_mult": 1.20,   # wide TP → R:R = 2.4:1
-        "trail_pct": 0.22,       # tighter trail to lock profit
-        "cooldown_ms": 30_000,   # 30s cooldown
-        "max_hold": 12,
-        "max_daily_R": 20,       # high daily allowance
-        "max_positions": 3,      # max concurrent positions
-        "C_enter": 0.52,
-        "C_exit": 0.30,
-        "alpha": 4,
-        "conf_scale": True,
-        "breakeven_R": 0.7,      # move to BE after 0.7R
-        "partial_tp": True,      # take half at 1R
-    },
-    "ultra": {
-        "risk_pct": 0.035,       # 3.5% risk per trade
-        "max_risk_usd": 75.0,
-        "equity_cap_mult": 15,   # heavy compounding
-        "sl_range_mult": 0.50,   # KEEP SL the same — no tighter!
-        "tp_range_mult": 1.40,   # very wide TP → R:R = 2.8:1
-        "trail_pct": 0.20,       # tight trail
-        "cooldown_ms": 20_000,   # 20s cooldown
-        "max_hold": 12,
-        "max_daily_R": 30,       # very high daily allowance
-        "max_positions": 4,      # max concurrent positions
-        "C_enter": 0.50,
-        "C_exit": 0.28,
-        "alpha": 3.5,
-        "conf_scale": True,
-        "breakeven_R": 0.6,
-        "partial_tp": True,
-    },
-}
 
 
 # ─── Historical Data Download ─────────────────────────────────────────
@@ -319,6 +242,7 @@ class BacktestEngine:
         self._conf_scale = p["conf_scale"]
         self._breakeven_R = p["breakeven_R"]
         self._partial_tp = p["partial_tp"]
+        self._min_signals = p.get("min_signals", 2)
 
         self.config["C_enter"] = p["C_enter"]
         self.config["C_exit"] = p["C_exit"]
@@ -341,9 +265,6 @@ class BacktestEngine:
         # Per-symbol range tracker
         self._recent_ranges: Dict[str, RingBuffer] = {}
 
-        # Streak tracking for momentum sizing
-        self._win_streak = 0
-        self._loss_streak = 0
 
     def init_symbol(self, symbol: str):
         tick_size = self.config.get("tick_sizes", {}).get(symbol, 0.01)
@@ -429,7 +350,10 @@ class BacktestEngine:
         self.state.last_scores = scores
 
         weights = fuse.get_weights(self.config, {}, self.config.get("adaptive", {}))
-        direction, conf, raw = fuse.decide(scores, weights, self.config.get("alpha", 5), quality_gate)
+        direction, conf, raw = fuse.decide(
+            scores, weights, self.config.get("alpha", 5), quality_gate,
+            min_signals=self._min_signals,
+        )
 
         if direction == 0 or conf < self.config.get("C_enter", 0.65):
             return
@@ -439,6 +363,12 @@ class BacktestEngine:
 
     def _try_enter(self, symbol: str, direction: int, confidence: float,
                    kline: dict, scores: dict) -> None:
+        # Rolling edge check: skip or halve if recent win rate is poor
+        wr = self.state.rolling_win_rate(20)
+        if wr < 0.20:
+            return  # too many consecutive losses — sit out
+        rolling_edge_mult = 0.5 if wr < 0.30 else 1.0
+
         side = Side.BUY if direction == 1 else Side.SELL
         tick_size = self.config.get("tick_sizes", {}).get(symbol, 0.01)
 
@@ -459,19 +389,20 @@ class BacktestEngine:
             stop_price = entry_price + stop_distance
             tp_price = entry_price - tp_distance
 
-        # Position sizing with compounding
-        use_equity = min(self.state.equity, self._fixed_equity * self._equity_cap_mult)
+        # Position sizing with sqrt-compounding (dampens runaway growth)
+        use_equity = self._fixed_equity * min(
+            math.sqrt(self.state.equity / self._fixed_equity),
+            self._equity_cap_mult,
+        )
         risk_dollars = min(use_equity * self._risk_pct, self._max_risk_usd)
 
-        # Confidence-scaled sizing: higher conf = bigger size (up to 1.5x)
+        # Confidence-scaled sizing: higher conf = modestly bigger size (up to 1.2x)
         if self._conf_scale and confidence > 0.6:
-            conf_mult = 1.0 + (confidence - 0.6) * 1.25  # 0.6→1.0x, 0.8→1.25x, 1.0→1.5x
-            risk_dollars *= min(conf_mult, 1.5)
+            conf_mult = 1.0 + (confidence - 0.6) * 0.5  # 0.6→1.0x, 0.8→1.1x, 1.0→1.2x
+            risk_dollars *= min(conf_mult, 1.2)
 
-        # Win streak bonus: after 3 consecutive wins, add 20% per extra win
-        if self._win_streak >= 3:
-            streak_mult = 1.0 + min(self._win_streak - 2, 3) * 0.2  # max 1.6x
-            risk_dollars *= streak_mult
+        # Apply rolling edge multiplier (0.5x if WR < 30%)
+        risk_dollars *= rolling_edge_mult
 
         if stop_distance <= 0:
             return
@@ -636,14 +567,6 @@ class BacktestEngine:
                 "duration_ms": result.duration_ms,
                 "reason": reason,
             })
-
-            # Update streaks
-            if result.pnl > 0:
-                self._win_streak += 1
-                self._loss_streak = 0
-            else:
-                self._loss_streak += 1
-                self._win_streak = 0
 
         self.equity_curve.append((ts, self.state.equity))
         self._partial_taken.pop(symbol, None)
@@ -1005,6 +928,108 @@ async def run_sweep(symbols: List[str], days: int = 30, equity: float = 50.0):
     print(f"    Lowest Drawdown:     {safest[0]} ({safest[1].get('max_drawdown_pct',0):.1f}%)")
     print(f"    Best Risk-Adjusted:  {best_risk_adj[0]} "
           f"(return/DD = {best_risk_adj[1].get('total_return_pct',0)/max(best_risk_adj[1].get('max_drawdown_pct',1),0.1):.2f})")
+
+    return results
+
+
+# ─── Backfill for Live Dashboard ─────────────────────────────────────────
+
+async def backfill_trades(symbols: list[str], config: dict, days: int = 7,
+                           equity: float = 50.0,
+                           profile: str = "aggressive") -> list[TradeResult]:
+    """Run a headless backtest and return TradeResult objects for dashboard seeding.
+
+    Downloads historical klines, runs the full signal pipeline, and returns
+    completed trades so the live dashboard can display 7D performance on startup.
+    """
+    import copy
+    bt_config = copy.deepcopy(config)
+    bt_config["initial_equity"] = equity
+
+    # Ensure tick sizes are available (use config defaults, fetch if missing)
+    missing = [s for s in symbols if s not in bt_config.get("tick_sizes", {})]
+    if missing:
+        try:
+            specs = await fetch_instruments()
+            for sym in missing:
+                if sym in specs:
+                    bt_config.setdefault("tick_sizes", {})[sym] = specs[sym]["tick_size"]
+                    bt_config.setdefault("min_qty", {})[sym] = specs[sym]["min_qty"]
+                    bt_config.setdefault("qty_step", {})[sym] = specs[sym]["qty_step"]
+        except Exception as e:
+            log.warning("Could not fetch instrument specs: %s", e)
+
+    # Download klines
+    end_ms = int(time.time() * 1000)
+    start_ms = end_ms - days * 86400 * 1000
+
+    all_klines: Dict[str, List[dict]] = {}
+    for sym in symbols:
+        log.info("  Backfill: downloading %dd klines for %s...", days, sym)
+        klines = await fetch_klines(sym, "1", start_ms, end_ms)
+        if len(klines) >= 100:
+            all_klines[sym] = klines
+            log.info("  Backfill: %s — %d candles", sym, len(klines))
+        else:
+            log.warning("  Backfill: %s — not enough data, skipping", sym)
+
+    if not all_klines:
+        return []
+
+    # Run backtest engine
+    engine = BacktestEngine(bt_config, initial_equity=equity, profile=profile)
+    for sym in all_klines:
+        engine.init_symbol(sym)
+
+    # Warm up indicators
+    warmup = 60
+    for sym, klines in all_klines.items():
+        tick_size = bt_config.get("tick_sizes", {}).get(sym, 0.01)
+        for i in range(min(warmup, len(klines))):
+            prev = klines[i - 1] if i > 0 else None
+            book = build_synthetic_book(klines[i], prev, tick_size)
+            engine.books[sym].on_snapshot(
+                [[p, s] for p, s in book.bids],
+                [[p, s] for p, s in book.asks],
+            )
+            trades = generate_synthetic_trades(
+                klines[i], prev["close"] if prev else klines[i]["open"], sym)
+            for t in trades:
+                engine.tapes[sym].add_trade(t)
+
+    # Process timeline
+    timeline = []
+    for sym, klines in all_klines.items():
+        for i in range(warmup, len(klines)):
+            timeline.append((klines[i]["ts"], sym, klines[i], klines[i - 1]))
+    timeline.sort(key=lambda x: x[0])
+
+    log.info("  Backfill: processing %d candles across %d symbols...",
+             len(timeline), len(all_klines))
+
+    last_day = 0
+    for ts, sym, kline, prev in timeline:
+        engine.process_candle(sym, kline, prev)
+        day = ts // 86400000
+        if day != last_day:
+            engine.equity_curve.append((ts, engine.state.equity))
+            last_day = day
+            if engine.state.kill_switch:
+                engine.state.reset_daily()
+
+    # Close any open positions
+    for sym, klines in all_klines.items():
+        if engine.state.has_position(sym):
+            engine.force_close_all(klines[-1])
+
+    results = list(engine.state.completed_trades.get())
+    report = engine.report()
+    log.info("  Backfill complete: %d trades, $%.2f → $%.2f (%+.1f%%), WR %.1f%%",
+             report.get("total_trades", 0),
+             equity,
+             report.get("final_equity", equity),
+             report.get("total_return_pct", 0),
+             report.get("win_rate", 0))
 
     return results
 

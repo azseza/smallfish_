@@ -70,7 +70,7 @@ WebSocket (L2 book + trades)
 +----------+          +---------------+
 | Terminal |          | Remote Control|
 | Dashboard|          | Telegram / Email
-| (termgraph)         +---------------+
+| (plotext) |         +---------------+
 +----------+
 ```
 
@@ -103,9 +103,14 @@ Grid profits are harvested automatically as price oscillates through levels.
 Activate with `--multigrid` or set `multigrid.enabled: true` in config.
 
 ### Terminal Dashboard (optional)
-Live terminal visualization using bar charts to display equity curve, trade PnL,
-signal weights, and grid status directly in your terminal. Designed for headless
-Raspberry Pi deployments where you SSH in to check on things.
+Live 2x2 plotext chart dashboard rendered directly in your terminal:
+
+- **Price chart** — live mid-price line with buy/sell scatter markers and position entry/SL/TP lines
+- **Equity curve** — running equity line (green when up, red when down)
+- **Trade P&L** — per-trade bar chart (green wins, red losses)
+- **Signal strength** — horizontal bars showing each signal's current score
+
+Designed for headless Raspberry Pi deployments where you SSH in to check on things.
 
 Activate with `--dashboard` or set `dashboard.enabled: true` in config.
 
@@ -159,11 +164,12 @@ Receive email notifications for critical events:
 ### Installation
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Or with Poetry
+# With Poetry (recommended)
 poetry install
+
+# Or with pip
+pip install pyyaml websockets aiohttp numpy orjson python-dotenv plotext
+pip install python-telegram-bot aiosmtplib  # optional: remote control
 ```
 
 ### Configuration
@@ -183,29 +189,45 @@ cp config/secrets.template.yaml config/secrets.yaml
 ### Run
 
 ```bash
-# Production — signal fusion mode (default)
+# --- Live Trading ---
+
+# Default config
 python src/app.py
 
-# With terminal dashboard
+# With a risk profile (conservative / balanced / aggressive / ultra)
+python src/app.py --mode aggressive
+
+# With the plotext terminal dashboard
 python src/app.py --dashboard
 
-# With multigrid strategy
-python src/app.py --multigrid
+# Dashboard + auto-scan top 5 high-volume symbols + aggressive profile
+AUTO_SYMBOLS=5 python src/app.py --mode aggressive --dashboard
 
-# With Telegram remote control
-python src/app.py --telegram
+# Dashboard + multigrid + Telegram — the full stack
+python src/app.py --mode aggressive --dashboard --multigrid --telegram
 
-# All features
-python src/app.py --dashboard --multigrid --telegram
+# Testnet (always start here)
+BYBIT_TESTNET=true python src/app.py --mode aggressive --dashboard
 
-# Testnet
-BYBIT_TESTNET=true python src/app.py
+# Testnet + auto-select the top 3 movers
+BYBIT_TESTNET=true AUTO_SYMBOLS=3 python src/app.py --mode aggressive --dashboard
 
-# Backtest
+# --- Backtesting ---
+
+# Single symbol
 python src/backtest.py --symbol BTCUSDT --days 30 --mode aggressive --equity 50
 
-# Backtest with profile sweep
-python src/backtest.py --symbol BTCUSDT --days 30 --sweep
+# Multiple symbols
+python src/backtest.py --symbols BTCUSDT ETHUSDT SOLUSDT --days 14 --mode aggressive --equity 50
+
+# Auto-scan top N symbols and backtest them
+python src/backtest.py --auto 5 --days 7 --mode aggressive --equity 50
+
+# With terminal charts (trade PnL + equity curve + signal weights)
+python src/backtest.py --auto 5 --days 7 --mode aggressive --equity 50 --chart
+
+# Sweep all 4 profiles and compare
+python src/backtest.py --symbols BTCUSDT ETHUSDT --days 30 --sweep --equity 50
 ```
 
 ### Tests
@@ -219,8 +241,9 @@ python -m pytest tests/ -v
 Smallfish is designed to run headless on a Raspberry Pi for 24/7 live trading:
 
 ```bash
-# Run in background with all monitoring
-nohup python src/app.py --telegram --dashboard > /dev/null 2>&1 &
+# Auto-pick the hottest symbols, aggressive mode, full monitoring
+BYBIT_TESTNET=true AUTO_SYMBOLS=5 \
+  nohup python src/app.py --mode aggressive --telegram --dashboard > /dev/null 2>&1 &
 
 # Check on it via Telegram: send /status to your bot
 # Or SSH in and attach to the dashboard
@@ -235,6 +258,7 @@ src/
 |-- core/
 |   |-- types.py           # Data types (Order, Position, Trade, etc.)
 |   |-- state.py           # Runtime state management
+|   |-- profiles.py        # Risk profiles (conservative → ultra) + apply_profile()
 |   |-- ringbuffer.py      # Fixed-size circular buffer
 |   +-- utils.py           # Math utilities (sigmoid, EMA, etc.)
 |-- marketdata/
@@ -263,7 +287,7 @@ src/
 |-- monitor/
 |   |-- metrics.py         # Performance analytics
 |   |-- heartbeat.py       # Health monitoring + state snapshots
-|   +-- dashboard.py       # Terminal bar chart dashboard (termgraph)
+|   +-- dashboard.py       # Terminal 2x2 chart dashboard (plotext)
 +-- remote/
     |-- telegram_bot.py    # Telegram bot for remote control
     +-- email_alert.py     # Email notifications for critical events
