@@ -7,9 +7,11 @@ Key principles:
 - Hard daily loss limit in R-multiples
 - Kill switch on slippage breaches
 - Volatility-adapted stops matching backtest engine
+- Sqrt-compounding to dampen runaway growth (matches backtest)
 """
 from __future__ import annotations
 import logging
+import math
 from core.types import Side
 from core.utils import clamp, qty_round, time_now_ms
 from marketdata.book import OrderBook
@@ -66,17 +68,24 @@ def position_size(state: RuntimeState, book: OrderBook,
     if stop_distance <= 0 or equity <= 0:
         return 0.0
 
-    # Base risk
+    # Base risk with sqrt-compounding (matches backtest sizing)
     risk_frac = config.get("risk_per_trade", 0.005)
     max_risk = config.get("max_risk_dollars", 5.0)
-    risk_dollars = min(risk_frac * equity, max_risk)
+
+    profile = config.get("profile")
+    if profile:
+        initial = config.get("initial_equity", equity)
+        cap = profile.get("equity_cap_mult", 3)
+        use_equity = initial * min(math.sqrt(equity / max(initial, 1)), cap)
+        risk_dollars = min(use_equity * risk_frac, max_risk)
+    else:
+        risk_dollars = min(risk_frac * equity, max_risk)
 
     # Drawdown tier adjustment
     dd_mult = state.size_multiplier()
     risk_dollars *= dd_mult
 
     # Confidence-scaled sizing (matches backtest when profile active)
-    profile = config.get("profile")
     if profile and profile.get("conf_scale") and confidence > 0.6:
         conf_mult = 1.0 + (confidence - 0.6) * 0.5  # 0.6→1.0x, 0.8→1.1x
         risk_dollars *= min(conf_mult, 1.2)
@@ -145,6 +154,12 @@ def can_trade(state: RuntimeState, book: OrderBook, symbol: str) -> tuple[bool, 
 
     if state.in_cooldown():
         return False, "loss_cooldown"
+
+    # Per-entry cooldown (matches backtest cooldown_ms)
+    cooldown_ms = config.get("cooldown_after_loss_ms", 5000)
+    last_entry = state.last_entry_ts.get(symbol, 0)
+    if time_now_ms() - last_entry < cooldown_ms:
+        return False, "entry_cooldown"
 
     if state.in_manual_cooldown():
         return False, "manual_cooldown"

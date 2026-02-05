@@ -66,6 +66,9 @@ class RuntimeState:
         # --- Volatility regime ---
         self.vol_regime: str = "normal"  # "low", "normal", "high", "extreme"
 
+        # --- Per-entry cooldown (matches backtest cooldown_ms) ---
+        self.last_entry_ts: Dict[str, int] = {}  # symbol → last entry timestamp ms
+
         # --- Manual cooldown (from /cooldown command) ---
         self.cooldown_until_ms: int = 0
 
@@ -160,6 +163,7 @@ class RuntimeState:
             peak_favorable=fill_price,
         )
         self.positions[symbol] = pos
+        self.last_entry_ts[symbol] = time_now_ms()
         log.info("ENTER %s %s qty=%.6f px=%.2f conf=%.3f",
                  side.name, symbol, quantity, fill_price, confidence)
         return pos

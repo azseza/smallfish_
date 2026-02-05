@@ -8,6 +8,7 @@ Async event-driven architecture processing orderbook and trade stream data.
 from __future__ import annotations
 import argparse
 import asyncio
+import datetime
 import logging
 import os
 import sys
@@ -19,6 +20,7 @@ from dotenv import load_dotenv
 from core.state import RuntimeState
 from core.types import (
     EventType, Side, Trade, WsEvent, OrderStatus, Position,
+    NormalizedExecution, NormalizedOrderUpdate, NormalizedPositionUpdate,
 )
 from core.utils import time_now_ms
 from core.profiles import PROFILES, apply_profile
@@ -298,6 +300,9 @@ async def main() -> None:
 
     log.info("Entering main event loop for symbols: %s", symbols)
 
+    # Track calendar day for daily reset
+    _last_day = datetime.datetime.now(datetime.timezone.utc).date()
+
     # --- Main Event Loop ---
     try:
         while not state.kill_switch:
@@ -311,7 +316,7 @@ async def main() -> None:
             # 2. Process private events (order fills, position updates)
             for prv_evt in ws.drain_private():
                 await process_private_event(prv_evt, state, config, books,
-                                            oco, persistence,
+                                            oco, persistence, rest,
                                             telegram=telegram, email_alerter=email_alerter)
 
             # 3. Manage open positions
@@ -344,6 +349,13 @@ async def main() -> None:
             state.update_latency(ws.latency_estimate_ms())
             heartbeat.check()
             persistence.flush_if_needed()
+
+            # 5a. Daily reset at midnight UTC
+            today = datetime.datetime.now(datetime.timezone.utc).date()
+            if today != _last_day:
+                state.reset_daily()
+                _last_day = today
+                log.info("Daily reset at midnight UTC")
 
             # 5b. Periodic equity sync from exchange
             now_ms = time_now_ms()
@@ -493,7 +505,13 @@ async def process_public_event(
     state.last_confidence = conf
     state.last_raw = raw
 
-    # Log decision
+    # Attempt entry (always, regardless of log_decisions)
+    if can and state.no_position(sym) and direction != 0 and conf >= config.get("C_enter", 0.65):
+        await try_enter(sym, direction, conf, book, tape, state, config,
+                        router, oco, scores, persistence,
+                        dashboard=dashboard)
+
+    # Optional decision logging
     if config.get("log_decisions") and abs(raw) > 0.01:
         decision_data = {
             "symbol": sym,
@@ -503,17 +521,9 @@ async def process_public_event(
             "spread_ticks": round(book.spread_ticks(), 2),
             "mid_price": round(book.mid_price(), 2),
             "vol_regime": vol_name,
-            "action": "none",
+            "action": "enter" if state.has_position(sym) else "none",
         }
         decision_data.update({k: round(v, 4) for k, v in scores.items()})
-
-        # Attempt entry if conditions met
-        if can and state.no_position(sym) and direction != 0 and conf >= config.get("C_enter", 0.65):
-            decision_data["action"] = "enter"
-            await try_enter(sym, direction, conf, book, tape, state, config,
-                            router, oco, scores, persistence,
-                            dashboard=dashboard)
-
         persistence.log_decision(decision_data)
 
 
@@ -599,18 +609,22 @@ async def process_private_event(
     books: dict[str, OrderBook],
     oco: OcoManager,
     persistence: Persistence,
+    rest=None,
     telegram=None,
     email_alerter=None,
 ) -> None:
-    """Handle private WS events: order fills, position updates."""
+    """Handle private WS events: order fills, position updates.
+
+    WS adapters emit NormalizedExecution / NormalizedOrderUpdate /
+    NormalizedPositionUpdate dataclasses — access via attribute, not .get().
+    """
     if evt.event_type == EventType.EXECUTION:
-        data = evt.data
-        symbol = data.get("symbol", "")
-        exec_price = float(data.get("execPrice", 0))
-        exec_qty = float(data.get("execQty", 0))
-        side_str = data.get("side", "")
-        is_maker = data.get("isMaker", False)
-        order_type = data.get("orderType", "")
+        data: NormalizedExecution = evt.data
+        symbol = data.symbol
+        exec_price = float(data.price)
+        exec_qty = float(data.quantity)
+        side_str = data.side.name if isinstance(data.side, Side) else str(data.side)
+        order_type = data.order_type
 
         # Check for slippage on entry fills
         pos = state.position(symbol)
@@ -629,7 +643,7 @@ async def process_private_event(
                     await oco.flatten_all(state.positions)
 
         persistence.log_order({
-            "order_id": data.get("orderId", ""),
+            "order_id": data.order_id,
             "symbol": symbol,
             "side": side_str,
             "type": order_type,
@@ -639,16 +653,23 @@ async def process_private_event(
         })
 
     elif evt.event_type == EventType.ORDER:
-        data = evt.data
-        status = data.get("orderStatus", "")
-        symbol = data.get("symbol", "")
+        data: NormalizedOrderUpdate = evt.data
+        status = data.status
+        symbol = data.symbol
 
         # Handle TP/SL fills (position closed)
-        if status == "Filled" and data.get("reduceOnly", False):
-            fill_price = float(data.get("avgPrice", 0))
-            reason = "tp_hit" if data.get("stopOrderType") == "TakeProfit" else "sl_hit"
+        if status == "Filled" and data.reduce_only:
+            fill_price = float(data.avg_price)
+            reason = "tp_hit" if data.stop_order_type == "TakeProfit" else "sl_hit"
             result = state.on_exit(symbol, fill_price, reason)
             if result:
+                # Binance bracket cleanup: cancel the paired TP/SL order
+                if rest and hasattr(rest, 'cleanup_bracket'):
+                    try:
+                        await rest.cleanup_bracket(symbol, data.order_id)
+                    except Exception as e:
+                        log.debug("Bracket cleanup: %s", e)
+
                 persistence.log_trade({
                     "symbol": symbol,
                     "side": result.side.name,
@@ -664,9 +685,9 @@ async def process_private_event(
                     await telegram.alert_trade(result)
 
     elif evt.event_type == EventType.POSITION:
-        data = evt.data
-        symbol = data.get("symbol", "")
-        size = float(data.get("size", 0))
+        data: NormalizedPositionUpdate = evt.data
+        symbol = data.symbol
+        size = float(data.size)
 
         # Position closed externally (stop hit, liquidation, manual)
         if size == 0 and state.has_position(symbol):
