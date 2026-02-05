@@ -117,9 +117,12 @@ class TerminalDashboard:
         self._running = False
         self._live: Optional[Live] = None
 
-        # OHLCV candle buffer for candlestick chart
+        # OHLCV candle buffer for candlestick chart (single symbol only)
         self._candles: deque[OHLCCandle] = deque(maxlen=_MAX_CANDLES)
         self._current_candle: Optional[OHLCCandle] = None
+        self._last_valid_price: float = 0.0  # for outlier rejection
+        symbols = config.get("symbols", [])
+        self.chart_symbol: str = symbols[0] if symbols else ""
 
         # Order markers on candle chart
         self._buy_markers: list[Tuple[int, float]] = []   # (candle_idx, price)
@@ -131,6 +134,10 @@ class TerminalDashboard:
         # System info cache (refreshed every 5s to avoid overhead)
         self._sys_info: dict = {}
         self._sys_info_ts: float = 0
+
+        # Cached terminal size (refreshed each render cycle)
+        self._term_cols: int = 160
+        self._term_rows: int = 50
 
         # Backfill ROI from 7D backtest (set by app.py at startup)
         self._backfill_roi: Optional[float] = None
@@ -145,18 +152,38 @@ class TerminalDashboard:
         Args:
             klines: list of dicts with keys: ts, open, high, low, close, volume
         """
+        last_close = 0.0
         for k in klines:
-            candle = OHLCCandle(
-                ts=int(k["ts"]) // 1000,  # ms → seconds
-                open=k["open"],
-                high=k["high"],
-                low=k["low"],
-                close=k["close"],
-                volume=int(k.get("volume", 0)),
-            )
-            self._candles.append(candle)
-        # Set current candle to last historical candle so live ticks extend it
+            o, h, l, c = k["open"], k["high"], k["low"], k["close"]
+            # Sanity check: reject candles where any OHLC deviates >30% from
+            # previous close (catches turnover/volume leaked into price fields)
+            if last_close > 0:
+                for val in (o, h, l, c):
+                    if abs(val - last_close) / last_close > 0.30:
+                        log.debug("Rejected historical candle ts=%s (val=%.2f vs last=%.2f)",
+                                  k.get("ts"), val, last_close)
+                        break
+                else:
+                    candle = OHLCCandle(
+                        ts=int(k["ts"]) // 1000,
+                        open=o, high=h, low=l, close=c,
+                        volume=int(k.get("volume", 0)),
+                    )
+                    self._candles.append(candle)
+                    last_close = c
+            else:
+                # First candle — accept unconditionally
+                candle = OHLCCandle(
+                    ts=int(k["ts"]) // 1000,
+                    open=o, high=h, low=l, close=c,
+                    volume=int(k.get("volume", 0)),
+                )
+                self._candles.append(candle)
+                last_close = c
+
+        # Seed last_valid_price from historical data for live outlier rejection
         if self._candles:
+            self._last_valid_price = self._candles[-1].close
             self._current_candle = None  # will start fresh on next tick
 
     def set_backfill_roi(self, roi_pct: float, trade_count: int,
@@ -171,7 +198,20 @@ class TerminalDashboard:
 
         Should be called with actual trade prices (not mid-prices) so candles
         have realistic OHLC ranges matching exchange kline data.
+        Rejects outlier prices (>30% deviation from last known price).
         """
+        if price <= 0:
+            return
+
+        # Outlier rejection: skip any price that deviates >30% from last known
+        if self._last_valid_price > 0:
+            deviation = abs(price - self._last_valid_price) / self._last_valid_price
+            if deviation > 0.30:
+                log.debug("Rejected outlier price %.2f (last valid %.2f, dev %.1f%%)",
+                          price, self._last_valid_price, deviation * 100)
+                return
+        self._last_valid_price = price
+
         now = int(time.time())
         candle_ts = now - (now % _CANDLE_INTERVAL_S)
 
@@ -236,8 +276,8 @@ class TerminalDashboard:
                     try:
                         self._record_snapshot()
                         live.update(self._render())
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log.debug("Dashboard render error: %s", exc)
                     await asyncio.sleep(self.refresh_s)
         except Exception as exc:
             for h in suppressed:
@@ -276,14 +316,32 @@ class TerminalDashboard:
         )
         return layout
 
+    def _get_terminal_size(self) -> Tuple[int, int]:
+        """Get terminal size, cached per render cycle."""
+        try:
+            return os.get_terminal_size()
+        except OSError:
+            return (160, 50)
+
     def _render(self) -> Layout:
         layout = self._make_layout()
-        layout["status"].update(self._build_status_panel())
-        layout["stats"].update(self._build_stats_panel())
-        layout["trades"].update(self._build_trades_panel())
-        layout["candles"].update(self._build_candle_panel())
-        layout["equity"].update(self._build_equity_panel())
-        layout["signals"].update(self._build_signals_panel())
+        # Cache terminal size once per render cycle
+        self._term_cols, self._term_rows = self._get_terminal_size()
+
+        panels = {
+            "status": self._build_status_panel,
+            "stats": self._build_stats_panel,
+            "trades": self._build_trades_panel,
+            "candles": self._build_candle_panel,
+            "equity": self._build_equity_panel,
+            "signals": self._build_signals_panel,
+        }
+        for name, builder in panels.items():
+            try:
+                layout[name].update(builder())
+            except Exception as exc:
+                log.debug("Panel %s error: %s", name, exc)
+                layout[name].update(Panel(Text(f"{name}: render error", style="red")))
         return layout
 
     # ── Status panel (system + bot info) ──────────────────────────
@@ -495,95 +553,81 @@ class TerminalDashboard:
                 border_style="blue",
             )
 
-        try:
-            from candlestick_chart import Candle, Chart
-
-            try:
-                cols, rows = os.get_terminal_size()
-            except OSError:
-                cols, rows = 160, 50
-
-            # Size the chart to fill the panel
-            chart_w = max(40, cols * 20 // 34 - 4)
-            chart_h = max(10, int(rows * 0.55) - 4)
-
-            # Show last N candles that fit
-            max_candles = max(10, chart_w // 3)
-            display = candles[-max_candles:]
-
-            cc_candles = [
-                Candle(open=c.open, close=c.close, high=c.high, low=c.low)
-                for c in display
-            ]
-
-            # Determine symbol from active positions or config
-            syms = list(self.state.positions.keys())
-            sym_label = syms[0] if syms else (
-                self.config.get("symbols", [""])[0] if self.config.get("symbols") else ""
-            )
-            last_price = display[-1].close
-
-            chart = Chart(cc_candles, title=f"{sym_label} ${last_price:,.2f}")
-            chart.update_size(chart_w, chart_h)
-            chart.set_bull_color(0, 200, 80)
-            chart.set_bear_color(200, 60, 60)
-            chart.set_volume_pane_enabled(False)
-
-            # Draw position lines info as subtitle
-            pos_info = ""
-            for pos in self.state.positions.values():
-                side_s = "L" if pos.side.value == 1 else "S"
-                pos_info += (f"  [{side_s}] entry={pos.entry_price:.2f}"
-                             f" SL={pos.stop_price:.2f} TP={pos.tp_price:.2f}")
-
-            title = "PRICE (1m candles)"
-            if pos_info:
-                title += pos_info
-
-            return Panel(chart, title=title, title_align="left",
-                         border_style="blue")
-        except ImportError:
-            # Fallback to plotext line if candlestick-chart not installed
-            return self._build_candle_fallback(candles)
-
-    def _build_candle_fallback(self, candles: list) -> Panel:
-        """Fallback price chart using plotext when candlestick-chart is missing."""
-        try:
-            cols, rows = os.get_terminal_size()
-        except OSError:
-            cols, rows = 160, 50
+        cols, rows = self._term_cols, self._term_rows
 
         chart_w = max(40, cols * 20 // 34 - 4)
-        chart_h = max(8, int(rows * 0.55) - 4)
+        chart_h = max(5, int(rows * 0.55) - 4)
+
+        # Show last N candles that fit (each candle ~2 cols wide)
+        max_candles = max(10, chart_w // 2)
+        display = candles[-max_candles:]
 
         plt.clf()
         plt.clt()
         plt.plotsize(chart_w, chart_h)
-        plt.title("Price (1m)")
         plt.theme("dark")
 
-        closes = [c.close for c in candles[-60:]]
-        xs = list(range(len(closes)))
-        plt.plot(xs, closes, color="white", label="close")
+        # Compute Y-axis range from displayed candles
+        y_lo = min(c.low for c in display)
+        y_hi = max(c.high for c in display)
+        y_margin = max((y_hi - y_lo) * 0.05, 0.01)
 
+        # Draw OHLC candles: wick (high-low line) + body (open-close bar)
+        for i, c in enumerate(display):
+            color = "green" if c.close >= c.open else "red"
+            # Wick
+            plt.plot([i, i], [c.low, c.high], color=color)
+            # Body
+            body_lo = min(c.open, c.close)
+            body_hi = max(c.open, c.close)
+            if body_hi == body_lo:
+                body_hi = body_lo + 0.01  # doji
+            plt.plot([i, i], [body_lo, body_hi], color=color, marker="hd")
+
+        # Position entry/SL/TP lines — only if within visible price range
         for pos in self.state.positions.values():
-            plt.hline(pos.entry_price, color="cyan")
-            plt.hline(pos.stop_price, color="red")
-            plt.hline(pos.tp_price, color="green")
+            if pos.entry_price > 0 and y_lo * 0.7 < pos.entry_price < y_hi * 1.3:
+                plt.hline(pos.entry_price, color="cyan")
+                y_lo = min(y_lo, pos.entry_price)
+                y_hi = max(y_hi, pos.entry_price)
+            if pos.stop_price > 0 and y_lo * 0.7 < pos.stop_price < y_hi * 1.3:
+                plt.hline(pos.stop_price, color="red+")
+                y_lo = min(y_lo, pos.stop_price)
+                y_hi = max(y_hi, pos.stop_price)
+            if pos.tp_price > 0 and y_lo * 0.7 < pos.tp_price < y_hi * 1.3:
+                plt.hline(pos.tp_price, color="green+")
+                y_lo = min(y_lo, pos.tp_price)
+                y_hi = max(y_hi, pos.tp_price)
 
-        return Panel(Text.from_ansi(plt.build()), title="PRICE (1m)",
+        # Lock Y-axis to candle range (prevents any stray data from stretching)
+        plt.ylim(y_lo - y_margin, y_hi + y_margin)
+
+        # Determine symbol + price for title
+        sym_label = self.chart_symbol or (
+            self.config.get("symbols", [""])[0] if self.config.get("symbols") else ""
+        )
+        last_price = display[-1].close
+
+        pos_info = ""
+        for pos in self.state.positions.values():
+            side_s = "L" if pos.side.value == 1 else "S"
+            pos_info += (f"  [{side_s}] entry={pos.entry_price:.2f}"
+                         f" SL={pos.stop_price:.2f} TP={pos.tp_price:.2f}")
+
+        title = f"PRICE {sym_label} ${last_price:,.2f}"
+        if pos_info:
+            title += pos_info
+
+        return Panel(Text.from_ansi(plt.build()), title=title,
                      title_align="left", border_style="blue")
 
     # ── Equity curve panel ────────────────────────────────────────
 
     def _build_equity_panel(self) -> Panel:
-        try:
-            cols, rows = os.get_terminal_size()
-        except OSError:
-            cols, rows = 160, 50
+        cols, rows = self._term_cols, self._term_rows
 
         chart_w = max(30, cols * 10 // 34 - 4)
-        chart_h = max(8, int(rows * 0.35) - 4)
+        chart_h = max(5, int(rows * 0.35) - 4)
 
         plt.clf()
         plt.clt()
@@ -606,13 +650,10 @@ class TerminalDashboard:
     # ── Signals panel ─────────────────────────────────────────────
 
     def _build_signals_panel(self) -> Panel:
-        try:
-            cols, rows = os.get_terminal_size()
-        except OSError:
-            cols, rows = 160, 50
+        cols, rows = self._term_cols, self._term_rows
 
         chart_w = max(30, cols * 10 // 34 - 4)
-        chart_h = max(8, int(rows * 0.35) - 4)
+        chart_h = max(5, int(rows * 0.35) - 4)
 
         plt.clf()
         plt.clt()

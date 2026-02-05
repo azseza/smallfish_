@@ -346,3 +346,34 @@ class BybitREST(ExchangeREST):
     async def cleanup_bracket(self, symbol: str, order_id: str) -> None:
         """No-op for Bybit — native TP/SL handles cleanup automatically."""
         pass
+
+    async def withdraw(self, coin: str, chain: str, address: str,
+                       amount: float) -> dict:
+        payload = {
+            "coin": coin,
+            "chain": chain,
+            "address": address,
+            "amount": _fmt(amount),
+            "forceChain": 1,
+            "accountType": "UNIFIED",
+        }
+        data = await self._post("/v5/asset/withdraw/create", payload)
+        ret = data.get("retCode", -1)
+        return {
+            "success": ret == 0,
+            "tx_id": data.get("result", {}).get("id", ""),
+            "error_msg": data.get("retMsg", "") if ret != 0 else "",
+        }
+
+    async def get_deposit_address(self, coin: str, chain: str) -> dict:
+        data = await self._get("/v5/asset/deposit/query-address", {
+            "coin": coin, "chainType": chain,
+        })
+        result = data.get("result", {})
+        chains = result.get("chains", [{}])
+        addr_info = chains[0] if chains else {}
+        return {
+            "address": addr_info.get("addressDeposit", ""),
+            "chain": addr_info.get("chain", chain),
+            "tag": addr_info.get("tagDeposit", ""),
+        }

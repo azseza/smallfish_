@@ -66,6 +66,13 @@ class RuntimeState:
         # --- Volatility regime ---
         self.vol_regime: str = "normal"  # "low", "normal", "high", "extreme"
 
+        # --- Manual cooldown (from /cooldown command) ---
+        self.cooldown_until_ms: int = 0
+
+        # --- Cash out state ---
+        self.pending_cashout: Optional[dict] = None  # preview state for confirmation
+        self.withdrawal_history: list[dict] = []  # [{ts, amount, tx_id, address}]
+
     # --- Position helpers ---
 
     def position(self, symbol: str) -> Optional[Position]:
@@ -106,6 +113,12 @@ class RuntimeState:
             return False
         cooldown = self.config.get("cooldown_after_loss_ms", 5000)
         return (time_now_ms() - self.last_loss_time) < cooldown
+
+    def in_manual_cooldown(self) -> bool:
+        """Check if manual cooldown (from /cooldown command) is active."""
+        if self.cooldown_until_ms == 0:
+            return False
+        return time_now_ms() < self.cooldown_until_ms
 
     # --- Kill switch ---
 

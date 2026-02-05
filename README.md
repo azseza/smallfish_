@@ -180,16 +180,104 @@ Key findings from parameter sweeps:
 ## Remote Control
 
 ### Telegram Bot
+
 Control and monitor your Smallfish instance from anywhere via Telegram.
 
-Commands:
-- `/status` — Equity, positions, PnL, drawdown, vol regime
-- `/trades` — Recent trade history with PnL bars
-- `/equity` — Equity curve chart
-- `/grid` — Multigrid status and active levels
-- `/kill` — Trigger kill switch remotely
-- `/resume` — Reset kill switch and resume trading
-- `/config` — View current profile and risk parameters
+#### Setup
+
+1. Open Telegram and search for **@BotFather**
+2. Send `/newbot`, choose a name (e.g. `Smallfish Trading`) and a username ending in `bot`
+3. BotFather replies with a **token** — copy it
+4. Open a chat with your new bot, tap **Start**, and send any message (e.g. `hello`)
+5. Open this URL in your browser (replace `<TOKEN>` with your token):
+   ```
+   https://api.telegram.org/bot<TOKEN>/getUpdates
+   ```
+6. Find `"chat":{"id":123456789}` in the JSON — that number is your **chat ID**
+7. Add both to your `.env`:
+   ```bash
+   TELEGRAM_BOT_TOKEN="your_bot_token_here"
+   TELEGRAM_CHAT_ID="your_chat_id_here"
+   ```
+8. Run with the `--telegram` flag:
+   ```bash
+   BYBIT_TESTNET=true python src/app.py --mode aggressive --telegram
+   ```
+9. Send `/help` to your bot to verify it works
+
+**Optional:** Send `/setcommands` to @BotFather and paste the command list below to enable autocomplete in Telegram:
+```
+status - Account summary + positions
+stats - Live stats: equity, PnL, WR, Sharpe
+balance - Detailed balance & margin info
+equity - Equity curve & drawdown
+trades - Recent trade history
+pnl - Daily P&L breakdown
+signals - Current signal scores
+symbols - Active symbols
+kill - Emergency stop all trading
+resume - Resume after kill switch
+close - Close position(s)
+cooldown - Pause trading N minutes
+mode - Switch risk profile
+sl - Move stop-loss
+tp - Move take-profit
+notify - Toggle trade notifications
+alert - Fine-grained alert control
+config - View current settings
+grid - Multigrid status
+cashout - Withdraw profits
+wallet - Cold wallet info
+backtest - Quick backtest report
+help - List all commands
+```
+
+#### Commands
+
+**Monitoring**
+- `/status` — Account summary + open positions
+- `/stats` — Live stats: equity, PnL, win rate, profit factor, drawdown, Sharpe
+- `/balance` — Detailed balance: equity, available margin, unrealized PnL
+- `/equity` — Equity curve and drawdown info
+- `/trades` — Recent trade history with PnL and R-multiples
+- `/pnl [days]` — Daily P&L breakdown (default 7 days)
+- `/signals` — Current signal scores for all 13 signals
+- `/symbols` — Active symbols with position info
+
+**Control**
+- `/kill` — Emergency stop all trading
+- `/resume` — Resume after kill switch
+- `/close [symbol]` — Close specific position or all positions
+- `/cooldown [minutes]` — Pause trading for N minutes (default 5)
+- `/mode <profile>` — Switch risk profile (conservative/balanced/aggressive/ultra)
+
+**Position Management**
+- `/sl <symbol> <price>` — Move stop-loss for open position
+- `/tp <symbol> <price>` — Move take-profit for open position
+
+**Notifications**
+- `/notify [on|off]` — Toggle trade-by-trade fill notifications
+- `/alert [dd|trade|all] [on|off]` — Fine-grained alert control (kill switch alerts always on)
+
+**Finance**
+- `/cashout [amount]` — Withdraw profits to cold wallet (preview + confirm flow)
+- `/wallet` — Cold wallet address and withdrawal history
+- `/backtest [symbol] [days]` — Run a quick backtest and report ROI
+
+**Config**
+- `/config` — View current settings
+- `/grid` — Multigrid status
+
+#### Cash Out Setup
+
+To use `/cashout`, configure a cold wallet address in `.env`:
+```bash
+COLD_WALLET_ADDRESS="TRxYourTronUSDTAddress"
+COLD_WALLET_CHAIN="TRC20"          # TRC20 (Tron) — cheapest USDT fees (~$1)
+MIN_WITHDRAWAL="10"                 # minimum $ to withdraw
+```
+
+The cashout flow closes all open positions, submits a USDT withdrawal, and pauses trading for 5 minutes while equity syncs. Always test on testnet first.
 
 ### Email Alerts
 Receive email notifications for critical events:

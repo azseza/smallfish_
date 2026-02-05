@@ -452,7 +452,9 @@ async def process_public_event(
         trade: Trade = evt.data
         tape.add_trade(trade)
         # Feed trade price to dashboard (builds real OHLCV candles)
-        if dashboard:
+        # Only feed the primary symbol to avoid mixing prices from
+        # different symbols (e.g. BTC 98k + DOGE 0.25 → broken Y-axis)
+        if dashboard and sym == dashboard.chart_symbol:
             dashboard.add_price_point(trade.price, trade.quantity)
 
     # --- Signal Pipeline (runs on every book delta and trade) ---

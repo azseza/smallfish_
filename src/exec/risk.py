@@ -146,6 +146,9 @@ def can_trade(state: RuntimeState, book: OrderBook, symbol: str) -> tuple[bool, 
     if state.in_cooldown():
         return False, "loss_cooldown"
 
+    if state.in_manual_cooldown():
+        return False, "manual_cooldown"
+
     if state.daily_loss_R >= config.get("max_daily_R", 10):
         return False, f"daily_loss_limit: {state.daily_loss_R:.1f}R"
 

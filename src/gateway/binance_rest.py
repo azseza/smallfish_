@@ -425,3 +425,44 @@ class BinanceREST(ExchangeREST):
                 unique.append(k)
         unique.sort(key=lambda x: x["ts"])
         return unique
+
+    async def withdraw(self, coin: str, chain: str, address: str,
+                       amount: float) -> dict:
+        # Binance uses /sapi/v1/ for wallet operations
+        params = {
+            "coin": coin,
+            "network": chain,
+            "address": address,
+            "amount": _fmt(amount),
+        }
+        session = await self._get_session()
+        params = self._signed_params(params)
+        headers = self._auth_headers()
+        url = f"https://api.binance.com/sapi/v1/capital/withdraw/apply"
+        if self.testnet:
+            url = f"https://testnet.binance.vision/sapi/v1/capital/withdraw/apply"
+        async with session.request("POST", url, params=params, headers=headers) as resp:
+            data = await resp.json(content_type=None)
+        if isinstance(data, dict) and "id" in data:
+            return {"success": True, "tx_id": data["id"], "error_msg": ""}
+        return {
+            "success": False,
+            "tx_id": "",
+            "error_msg": data.get("msg", str(data)),
+        }
+
+    async def get_deposit_address(self, coin: str, chain: str) -> dict:
+        session = await self._get_session()
+        params = {"coin": coin, "network": chain}
+        params = self._signed_params(params)
+        headers = self._auth_headers()
+        url = f"https://api.binance.com/sapi/v1/capital/deposit/address"
+        if self.testnet:
+            url = f"https://testnet.binance.vision/sapi/v1/capital/deposit/address"
+        async with session.request("GET", url, params=params, headers=headers) as resp:
+            data = await resp.json(content_type=None)
+        return {
+            "address": data.get("address", ""),
+            "chain": data.get("coin", chain),
+            "tag": data.get("tag", ""),
+        }

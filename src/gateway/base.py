@@ -118,6 +118,17 @@ class ExchangeREST(ABC):
     async def cleanup_bracket(self, symbol: str, order_id: str) -> None: ...
 
     @abstractmethod
+    async def withdraw(self, coin: str, chain: str, address: str,
+                       amount: float) -> dict:
+        """Submit withdrawal. Returns {success, tx_id, error_msg}."""
+        ...
+
+    @abstractmethod
+    async def get_deposit_address(self, coin: str, chain: str) -> dict:
+        """Get deposit address. Returns {address, chain, tag}."""
+        ...
+
+    @abstractmethod
     async def close(self) -> None: ...
 
 

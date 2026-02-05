@@ -11,22 +11,42 @@ Setup:
     5. Run with --telegram flag
 
 Commands:
-    /status  - Account summary (equity, PnL, positions, regime)
-    /trades  - Recent trade history with PnL
-    /equity  - Equity and drawdown info
-    /grid    - Multigrid status
-    /kill    - Trigger kill switch
-    /resume  - Reset kill switch
-    /config  - View current profile parameters
-    /help    - List commands
+    /status    - Account summary (equity, PnL, positions, regime)
+    /stats     - Live stats: equity, PnL, WR, PF, DD, Sharpe
+    /balance   - Detailed balance & margin info
+    /equity    - Equity and drawdown info
+    /trades    - Recent trade history with PnL
+    /pnl [7]   - Daily P&L breakdown
+    /signals   - Current signal scores
+    /symbols   - Active symbols + spreads
+    /kill      - Trigger kill switch
+    /resume    - Reset kill switch
+    /close     - Close position(s)
+    /cooldown  - Pause trading N minutes
+    /mode      - Switch risk profile
+    /sl        - Move stop-loss
+    /tp        - Move take-profit
+    /notify    - Toggle trade notifications
+    /alert     - Fine-grained alert control
+    /config    - View current profile parameters
+    /grid      - Multigrid status
+    /cashout   - Withdraw profits to cold wallet
+    /wallet    - Cold wallet info + history
+    /backtest  - Quick backtest report
+    /help      - List commands
 """
 from __future__ import annotations
 import asyncio
+import inspect
 import logging
+import math
 import os
+import time as _time
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from core.state import RuntimeState
+from core.utils import time_now_ms
 
 log = logging.getLogger(__name__)
 
@@ -34,10 +54,12 @@ log = logging.getLogger(__name__)
 class TelegramBot:
     """Async Telegram bot for remote Smallfish control."""
 
-    def __init__(self, state: RuntimeState, config: dict, grid_strategy=None):
+    def __init__(self, state: RuntimeState, config: dict,
+                 grid_strategy=None, rest=None):
         self.state = state
         self.config = config
         self.grid = grid_strategy
+        self.rest = rest  # ExchangeREST instance for /close, /sl, /tp, /cashout
         self.token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
         self.chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
         self.enabled = bool(self.token and self.chat_id)
@@ -121,29 +143,49 @@ class TelegramBot:
         if not text.startswith("/"):
             return
 
-        cmd = text.split()[0].lower()
+        parts = text.split()
+        cmd = parts[0].lower()
+        args = parts[1:] if len(parts) > 1 else []
+
         handlers = {
             "/status": self._cmd_status,
+            "/stats": self._cmd_stats,
+            "/balance": self._cmd_balance,
             "/trades": self._cmd_trades,
             "/equity": self._cmd_equity,
+            "/pnl": self._cmd_pnl,
+            "/signals": self._cmd_signals,
+            "/symbols": self._cmd_symbols,
             "/grid": self._cmd_grid,
             "/kill": self._cmd_kill,
             "/resume": self._cmd_resume,
+            "/close": self._cmd_close,
+            "/cooldown": self._cmd_cooldown,
+            "/mode": self._cmd_mode,
+            "/sl": self._cmd_sl,
+            "/tp": self._cmd_tp,
+            "/notify": self._cmd_notify,
+            "/alert": self._cmd_alert,
             "/config": self._cmd_config,
+            "/cashout": self._cmd_cashout,
+            "/wallet": self._cmd_wallet,
+            "/backtest": self._cmd_backtest,
             "/help": self._cmd_help,
             "/start": self._cmd_help,
         }
 
         handler = handlers.get(cmd)
         if handler:
-            response = handler()
-            await self.send_message(response)
+            result = handler(args)
+            if inspect.isawaitable(result):
+                result = await result
+            await self.send_message(result)
         else:
             await self.send_message(f"Unknown command: {cmd}\nSend /help for available commands")
 
-    # --- Command handlers ---
+    # ── Monitoring commands ────────────────────────────────────────
 
-    def _cmd_status(self) -> str:
+    def _cmd_status(self, args: list = None) -> str:
         s = self.state
         wr = s.win_count / max(s.trade_count, 1) * 100
         kill_str = f"KILLED: {s.kill_reason}" if s.kill_switch else "LIVE"
@@ -175,7 +217,84 @@ class TelegramBot:
             f"Positions:{positions}"
         )
 
-    def _cmd_trades(self) -> str:
+    def _cmd_stats(self, args: list = None) -> str:
+        s = self.state
+        c = self.config
+        initial = c.get("initial_equity", 1000)
+        total_pnl = s.equity - initial
+        total_pct = total_pnl / max(initial, 0.01) * 100
+        daily_pct = s.daily_pnl / max(s.daily_start_equity, 0.01) * 100
+
+        completed = list(s.completed_trades.get())
+        wins = [t.pnl for t in completed if t.pnl > 0]
+        losses = [t.pnl for t in completed if t.pnl < 0]
+        avg_win = sum(wins) / len(wins) if wins else 0
+        avg_loss = sum(losses) / len(losses) if losses else 0
+        gross_win = sum(wins)
+        gross_loss = abs(sum(losses))
+        pf = gross_win / max(gross_loss, 0.01) if gross_loss > 0 else 0
+        best = max((t.pnl for t in completed), default=0)
+        worst = min((t.pnl for t in completed), default=0)
+        best_sym = next((t.symbol for t in completed if t.pnl == best), "") if completed else ""
+        worst_sym = next((t.symbol for t in completed if t.pnl == worst), "") if completed else ""
+
+        # Sharpe approximation (daily returns if enough data)
+        sharpe_str = "n/a"
+        if len(completed) >= 10:
+            returns = [t.pnl for t in completed]
+            mean_r = sum(returns) / len(returns)
+            var_r = sum((r - mean_r) ** 2 for r in returns) / len(returns)
+            std_r = math.sqrt(var_r) if var_r > 0 else 0
+            if std_r > 0:
+                sharpe_str = f"{mean_r / std_r:.2f}"
+
+        dd = s.drawdown * 100
+        mdd = s.max_drawdown * 100
+        wr = s.win_count / max(s.trade_count, 1) * 100
+
+        # Uptime
+        uptime_ms = time_now_ms() - s.started_at
+        uptime_s = uptime_ms // 1000
+        h, rem = divmod(uptime_s, 3600)
+        m, _ = divmod(rem, 60)
+
+        return (
+            f"><(((o> LIVE STATS\n\n"
+            f"Equity:       ${s.equity:.2f} (peak ${s.peak_equity:.2f})\n"
+            f"Daily PnL:    ${s.daily_pnl:+.2f} ({daily_pct:+.1f}%)\n"
+            f"Total PnL:    ${total_pnl:+.2f} ({total_pct:+.1f}%)\n"
+            f"Trades:       {s.trade_count} ({s.win_count}W / {s.loss_count}L)\n"
+            f"Win Rate:     {wr:.1f}%\n"
+            f"Profit Factor: {pf:.2f}\n"
+            f"Avg Win:      ${avg_win:+.2f}\n"
+            f"Avg Loss:     ${avg_loss:+.2f}\n"
+            f"Best Trade:   ${best:+.2f} ({best_sym})\n"
+            f"Worst Trade:  ${worst:+.2f} ({worst_sym})\n"
+            f"Sharpe:       {sharpe_str}\n"
+            f"Max Drawdown: {mdd:.1f}%\n"
+            f"Current DD:   {dd:.1f}%\n"
+            f"Daily R:      {s.daily_loss_R:.1f}R / {c.get('max_daily_R', 10)}R\n"
+            f"Vol Regime:   {s.vol_regime}\n"
+            f"Uptime:       {h}h{m:02d}m"
+        )
+
+    def _cmd_balance(self, args: list = None) -> str:
+        s = self.state
+        initial = self.config.get("initial_equity", 1000)
+        unrealized = sum(p.unrealized_pnl for p in s.positions.values())
+        available = s.equity - abs(unrealized)
+
+        return (
+            f"BALANCE\n"
+            f"Equity: ${s.equity:.2f}\n"
+            f"Available Margin: ${available:.2f}\n"
+            f"Unrealized PnL: ${unrealized:+.4f}\n"
+            f"Realized PnL: ${s.realized_pnl:+.4f}\n"
+            f"Initial: ${initial:.2f}\n"
+            f"Profit: ${s.equity - initial:+.2f}"
+        )
+
+    def _cmd_trades(self, args: list = None) -> str:
         trades = list(self.state.completed_trades.get())
         if not trades:
             return "No trades yet."
@@ -195,7 +314,7 @@ class TelegramBot:
         lines.append(f"\nLast {len(recent)} total: ${total:+.4f}")
         return "\n".join(lines)
 
-    def _cmd_equity(self) -> str:
+    def _cmd_equity(self, args: list = None) -> str:
         s = self.state
         initial = self.config.get("initial_equity", 1000)
         total_return = (s.equity - initial) / initial * 100 if initial > 0 else 0
@@ -210,7 +329,100 @@ class TelegramBot:
             f"Max DD: {s.max_drawdown*100:.2f}%"
         )
 
-    def _cmd_grid(self) -> str:
+    def _cmd_pnl(self, args: list = None) -> str:
+        days = 7
+        if args:
+            try:
+                days = int(args[0])
+            except ValueError:
+                pass
+        days = min(days, 30)
+
+        completed = list(self.state.completed_trades.get())
+        if not completed:
+            return "No trades yet."
+
+        now = datetime.now(timezone.utc)
+        buckets: dict[str, list[float]] = {}
+        for i in range(days):
+            key = (now - timedelta(days=i)).strftime("%m/%d")
+            buckets[key] = []
+
+        for t in completed:
+            key = datetime.fromtimestamp(
+                t.exit_time / 1000, tz=timezone.utc
+            ).strftime("%m/%d")
+            if key in buckets:
+                buckets[key].append(t.pnl)
+
+        lines = [f"P&L BREAKDOWN ({days}d)"]
+        total = 0.0
+        for i in range(days - 1, -1, -1):
+            key = (now - timedelta(days=i)).strftime("%m/%d")
+            pnls = buckets[key]
+            day_pnl = sum(pnls)
+            total += day_pnl
+            w = sum(1 for p in pnls if p >= 0)
+            l = sum(1 for p in pnls if p < 0)
+            mark = "+" if day_pnl >= 0 else "-"
+            lines.append(f"  {key}  {mark}${abs(day_pnl):.2f}  {w}W/{l}L")
+
+        lines.append(f"\nTotal: ${total:+.2f}")
+        return "\n".join(lines)
+
+    def _cmd_signals(self, args: list = None) -> str:
+        scores = self.state.last_scores
+        if not scores:
+            return "No signal data yet."
+
+        signal_pairs = [
+            ("OBI",    "obi_long",    "obi_short"),
+            ("PRT",    "prt_long",    "prt_short"),
+            ("UMOM",   "umom_long",   "umom_short"),
+            ("LTB",    "ltb_long",    "ltb_short"),
+            ("SWEEP",  "sweep_up",    "sweep_down"),
+            ("ICE",    "ice_long",    "ice_short"),
+            ("VWAP",   "vwap_long",   "vwap_short"),
+            ("REGIME", "regime_long", "regime_short"),
+            ("CVD",    "cvd_long",    "cvd_short"),
+            ("TPS",    "tps_long",    "tps_short"),
+            ("LIQ",    "liq_long",    "liq_short"),
+            ("MVR",    "mvr_long",    "mvr_short"),
+            ("ABSORB", "absorb_long", "absorb_short"),
+        ]
+
+        lines = ["SIGNAL SCORES"]
+        for label, lk, sk in signal_pairs:
+            lv = scores.get(lk, 0.0)
+            sv = scores.get(sk, 0.0)
+            net = lv - sv
+            arrow = ">" if net > 0.01 else "<" if net < -0.01 else "="
+            lines.append(f"  {label:<7} L={lv:.2f}  S={sv:.2f}  net={net:+.2f} {arrow}")
+
+        conf = self.state.last_confidence
+        d = self.state.last_direction
+        dir_s = "LONG" if d == 1 else "SHORT" if d == -1 else "FLAT"
+        lines.append(f"\nDirection: {dir_s}  Confidence: {conf:.3f}")
+        return "\n".join(lines)
+
+    def _cmd_symbols(self, args: list = None) -> str:
+        symbols = self.config.get("symbols", [])
+        if not symbols:
+            return "No active symbols."
+
+        lines = ["ACTIVE SYMBOLS"]
+        for sym in symbols:
+            pos = self.state.positions.get(sym)
+            pos_str = ""
+            if pos:
+                side = "LONG" if pos.side == 1 else "SHORT"
+                pos_str = f"  [{side} qty={pos.quantity:.4f}]"
+            lines.append(f"  {sym}{pos_str}")
+        return "\n".join(lines)
+
+    # ── Control commands ──────────────────────────────────────────
+
+    def _cmd_grid(self, args: list = None) -> str:
         if not self.grid:
             return "Multigrid is not enabled."
 
@@ -233,20 +445,187 @@ class TelegramBot:
             )
         return "\n".join(lines)
 
-    def _cmd_kill(self) -> str:
+    def _cmd_kill(self, args: list = None) -> str:
         if self.state.kill_switch:
             return f"Kill switch already active: {self.state.kill_reason}"
         self.state.trigger_kill_switch("telegram_remote")
         return "Kill switch TRIGGERED via Telegram. All trading stopped."
 
-    def _cmd_resume(self) -> str:
+    def _cmd_resume(self, args: list = None) -> str:
         if not self.state.kill_switch:
             return "Kill switch is not active. Trading is running."
         self.state.kill_switch = False
         self.state.kill_reason = ""
         return "Kill switch RESET. Trading resumed."
 
-    def _cmd_config(self) -> str:
+    async def _cmd_close(self, args: list = None) -> str:
+        if not self.rest:
+            return "REST client not available."
+
+        from core.types import Side
+
+        if args:
+            symbol = args[0].upper()
+            pos = self.state.positions.get(symbol)
+            if not pos:
+                return f"No open position for {symbol}."
+            close_side = Side.SELL if pos.side == Side.BUY else Side.BUY
+            from core.types import OrderType
+            resp = await self.rest.place_order(
+                symbol=symbol, side=close_side, qty=pos.quantity,
+                order_type=OrderType.MARKET, reduce_only=True,
+            )
+            if resp.success:
+                return f"Closed {symbol} position. Order ID: {resp.order_id}"
+            return f"Failed to close {symbol}: {resp.error_msg}"
+        else:
+            if not self.state.positions:
+                return "No open positions to close."
+            results = []
+            for sym, pos in list(self.state.positions.items()):
+                close_side = Side.SELL if pos.side == Side.BUY else Side.BUY
+                from core.types import OrderType
+                resp = await self.rest.place_order(
+                    symbol=sym, side=close_side, qty=pos.quantity,
+                    order_type=OrderType.MARKET, reduce_only=True,
+                )
+                if resp.success:
+                    results.append(f"  Closed {sym}")
+                else:
+                    results.append(f"  Failed {sym}: {resp.error_msg}")
+            return "CLOSE ALL POSITIONS\n" + "\n".join(results)
+
+    def _cmd_cooldown(self, args: list = None) -> str:
+        minutes = 5
+        if args:
+            try:
+                minutes = int(args[0])
+            except ValueError:
+                return "Usage: /cooldown [minutes]"
+        minutes = max(1, min(minutes, 1440))
+
+        self.state.cooldown_until_ms = time_now_ms() + minutes * 60 * 1000
+        return f"Trading paused for {minutes} minutes.\nResumes at cooldown end or /resume."
+
+    def _cmd_mode(self, args: list = None) -> str:
+        if not args:
+            current = self.config.get("profile", {}).get("name", "default")
+            return (
+                f"Current mode: {current}\n"
+                f"Usage: /mode <conservative|balanced|aggressive|ultra>"
+            )
+
+        profile_name = args[0].lower()
+        try:
+            from core.profiles import apply_profile
+            apply_profile(self.config, profile_name)
+            return f"Profile switched to: {profile_name.upper()}"
+        except ValueError as e:
+            return str(e)
+
+    async def _cmd_sl(self, args: list = None) -> str:
+        if not self.rest:
+            return "REST client not available."
+        if not args or len(args) < 2:
+            return "Usage: /sl <symbol> <price>"
+
+        symbol = args[0].upper()
+        try:
+            price = float(args[1])
+        except ValueError:
+            return "Invalid price."
+
+        pos = self.state.positions.get(symbol)
+        if not pos:
+            return f"No open position for {symbol}."
+
+        resp = await self.rest.set_trading_stop(symbol=symbol, stop_loss=price)
+        if resp.success:
+            pos.stop_price = price
+            return f"Stop-loss moved to {price:.2f} for {symbol}"
+        return f"Failed to move SL: {resp.error_msg}"
+
+    async def _cmd_tp(self, args: list = None) -> str:
+        if not self.rest:
+            return "REST client not available."
+        if not args or len(args) < 2:
+            return "Usage: /tp <symbol> <price>"
+
+        symbol = args[0].upper()
+        try:
+            price = float(args[1])
+        except ValueError:
+            return "Invalid price."
+
+        pos = self.state.positions.get(symbol)
+        if not pos:
+            return f"No open position for {symbol}."
+
+        resp = await self.rest.set_trading_stop(symbol=symbol, take_profit=price)
+        if resp.success:
+            pos.tp_price = price
+            return f"Take-profit moved to {price:.2f} for {symbol}"
+        return f"Failed to move TP: {resp.error_msg}"
+
+    # ── Notification commands ─────────────────────────────────────
+
+    def _cmd_notify(self, args: list = None) -> str:
+        tg = self.config.setdefault("telegram", {})
+        current = tg.get("notify_trades", False)
+
+        if not args:
+            status = "ON" if current else "OFF"
+            toggle = "off" if current else "on"
+            return f"Trade notifications: {status}\nUse /notify {toggle} to toggle"
+
+        val = args[0].lower()
+        if val == "on":
+            tg["notify_trades"] = True
+            return "Trade notifications: ON\nYou will receive a message for every completed trade."
+        elif val == "off":
+            tg["notify_trades"] = False
+            return "Trade notifications: OFF"
+        return "Usage: /notify [on|off]"
+
+    def _cmd_alert(self, args: list = None) -> str:
+        tg = self.config.setdefault("telegram", {})
+        alerts = tg.setdefault("alerts", {
+            "trade": False,
+            "drawdown": True,
+            "kill_switch": True,
+        })
+
+        if not args:
+            trade_s = "ON" if alerts.get("trade", False) else "OFF"
+            dd_s = "ON" if alerts.get("drawdown", True) else "OFF"
+            return (
+                f"Alert settings:\n"
+                f"  Trade fills: {trade_s}\n"
+                f"  Drawdown >5%: {dd_s}\n"
+                f"  Kill switch: ON (always on)"
+            )
+
+        category = args[0].lower()
+        if len(args) < 2:
+            return "Usage: /alert [dd|trade|all] [on|off]"
+
+        val = args[1].lower() == "on"
+
+        if category == "trade":
+            alerts["trade"] = val
+            return f"Trade fill alerts: {'ON' if val else 'OFF'}"
+        elif category == "dd":
+            alerts["drawdown"] = val
+            return f"Drawdown alerts: {'ON' if val else 'OFF'}"
+        elif category == "all":
+            alerts["trade"] = val
+            alerts["drawdown"] = val
+            return f"All configurable alerts: {'ON' if val else 'OFF'}\n(Kill switch alerts always stay ON)"
+        return "Unknown alert category. Use: trade, dd, all"
+
+    # ── Config commands ───────────────────────────────────────────
+
+    def _cmd_config(self, args: list = None) -> str:
         c = self.config
         return (
             f"CONFIG\n"
@@ -263,17 +642,213 @@ class TelegramBot:
             f"Dashboard: {'ON' if c.get('dashboard', {}).get('enabled') else 'OFF'}"
         )
 
-    def _cmd_help(self) -> str:
+    # ── Finance commands ──────────────────────────────────────────
+
+    async def _cmd_cashout(self, args: list = None) -> str:
+        if not self.rest:
+            return "REST client not available."
+
+        s = self.state
+        initial = self.config.get("initial_equity", 1000)
+        profit = s.equity - initial
+        cold_addr = os.environ.get("COLD_WALLET_ADDRESS", "")
+        chain = os.environ.get("COLD_WALLET_CHAIN", "TRC20")
+        min_wd = float(os.environ.get("MIN_WITHDRAWAL", "10"))
+
+        if not cold_addr:
+            return "No COLD_WALLET_ADDRESS configured in .env"
+
+        addr_short = cold_addr[:6] + "..." + cold_addr[-4:] if len(cold_addr) > 12 else cold_addr
+
+        # Handle confirm/cancel
+        if args and args[0].lower() == "confirm":
+            pending = s.pending_cashout
+            if not pending:
+                return "No pending cashout. Use /cashout to preview first."
+
+            amount = pending["amount"]
+
+            # Close all positions first
+            closed = 0
+            if s.positions:
+                from core.types import Side, OrderType
+                for sym, pos in list(s.positions.items()):
+                    close_side = Side.SELL if pos.side == Side.BUY else Side.BUY
+                    await self.rest.place_order(
+                        symbol=sym, side=close_side, qty=pos.quantity,
+                        order_type=OrderType.MARKET, reduce_only=True,
+                    )
+                    closed += 1
+
+            # Submit withdrawal
+            result = await self.rest.withdraw(
+                coin="USDT", chain=chain,
+                address=cold_addr, amount=amount,
+            )
+
+            s.pending_cashout = None
+
+            if not result["success"]:
+                return f"Withdrawal FAILED: {result['error_msg']}"
+
+            # Record withdrawal
+            s.withdrawal_history.append({
+                "ts": time_now_ms(),
+                "amount": amount,
+                "tx_id": result["tx_id"],
+                "address": cold_addr,
+            })
+
+            # Pause trading for 5 minutes
+            s.cooldown_until_ms = time_now_ms() + 5 * 60 * 1000
+
+            lines = ["WITHDRAWING..."]
+            if closed > 0:
+                lines.append(f"  Closed {closed} position(s)")
+            lines.append(f"  Withdrawal submitted: ${amount:.2f} USDT -> {addr_short}")
+            lines.append(f"  TX ID: {result['tx_id']}")
+            lines.append(f"  Trading paused for 5 min (equity sync)")
+            return "\n".join(lines)
+
+        if args and args[0].lower() == "cancel":
+            s.pending_cashout = None
+            return "Cashout cancelled."
+
+        # Preview
+        if profit < min_wd:
+            return (
+                f"CASH OUT\n"
+                f"Available profit: ${profit:.2f}\n"
+                f"Minimum withdrawal: ${min_wd:.2f}\n"
+                f"Not enough profit to withdraw."
+            )
+
+        # Specific amount
+        amount = profit
+        if args:
+            try:
+                amount = float(args[0])
+                amount = min(amount, profit)
+            except ValueError:
+                pass
+
+        if amount < min_wd:
+            return f"Amount ${amount:.2f} is below minimum ${min_wd:.2f}"
+
+        pos_count = len(s.positions)
+        s.pending_cashout = {"amount": amount, "ts": time_now_ms()}
+
+        lines = [
+            f"CASH OUT PREVIEW",
+            f"Current Equity: ${s.equity:.2f}",
+            f"Initial Equity: ${initial:.2f}",
+            f"Available Profit: ${profit:.2f}",
+            f"Amount to withdraw: ${amount:.2f}",
+            f"Destination: {addr_short} ({chain})",
+        ]
+        if pos_count > 0:
+            lines.append(f"\nOpen positions: {pos_count} (will be closed)")
+        lines.append(f"\nSend /cashout confirm to proceed")
+        lines.append(f"Send /cashout cancel to abort")
+        return "\n".join(lines)
+
+    def _cmd_wallet(self, args: list = None) -> str:
+        cold_addr = os.environ.get("COLD_WALLET_ADDRESS", "")
+        chain = os.environ.get("COLD_WALLET_CHAIN", "TRC20")
+
+        if not cold_addr:
+            return "No COLD_WALLET_ADDRESS configured in .env"
+
+        addr_short = cold_addr[:6] + "..." + cold_addr[-4:] if len(cold_addr) > 12 else cold_addr
+
+        lines = [
+            f"COLD WALLET",
+            f"  Address: {addr_short} ({chain})",
+            f"\nWITHDRAWAL HISTORY",
+        ]
+
+        history = self.state.withdrawal_history
+        if not history:
+            lines.append("  No withdrawals yet.")
+        else:
+            total = 0.0
+            for w in history:
+                dt = datetime.fromtimestamp(w["ts"] / 1000, tz=timezone.utc)
+                lines.append(f"  {dt.strftime('%m/%d')} ${w['amount']:.2f}  TX: {w['tx_id'][:12]}...")
+                total += w["amount"]
+            lines.append(f"\n  Total withdrawn: ${total:.2f}")
+        return "\n".join(lines)
+
+    async def _cmd_backtest(self, args: list = None) -> str:
+        symbol = "BTCUSDT"
+        days = 7
+        if args:
+            if len(args) >= 1:
+                symbol = args[0].upper()
+            if len(args) >= 2:
+                try:
+                    days = int(args[1])
+                except ValueError:
+                    pass
+        days = min(days, 30)
+
+        try:
+            from backtest import BacktestEngine
+            mode = self.config.get("profile", {}).get("name", "aggressive")
+            equity = self.config.get("initial_equity", 50)
+            exchange = self.config.get("exchange", "bybit")
+            engine = BacktestEngine(
+                symbol=symbol, days=days, mode=mode,
+                initial_equity=equity, exchange=exchange,
+            )
+            result = await engine.run()
+            roi = result.get("roi_pct", 0)
+            trades = result.get("total_trades", 0)
+            wr = result.get("win_rate", 0) * 100
+            pf = result.get("profit_factor", 0)
+            return (
+                f"BACKTEST: {symbol} ({days}d)\n"
+                f"ROI: {roi:+.1f}%\n"
+                f"Trades: {trades}\n"
+                f"Win Rate: {wr:.1f}%\n"
+                f"Profit Factor: {pf:.2f}"
+            )
+        except Exception as e:
+            return f"Backtest failed: {e}"
+
+    # ── Help ──────────────────────────────────────────────────────
+
+    def _cmd_help(self, args: list = None) -> str:
         return (
-            "><(((o> SMALLFISH COMMANDS\n"
-            "/status  - Account summary\n"
-            "/trades  - Recent trades\n"
-            "/equity  - Equity details\n"
-            "/grid    - Multigrid status\n"
-            "/kill    - Trigger kill switch\n"
-            "/resume  - Reset kill switch\n"
-            "/config  - View configuration\n"
-            "/help    - This message"
+            "><(((o> SMALLFISH COMMANDS\n\n"
+            "MONITORING\n"
+            "  /status    - Account summary + positions\n"
+            "  /stats     - Live stats: equity, PnL, WR, PF, DD, Sharpe\n"
+            "  /balance   - Detailed balance & margin info\n"
+            "  /equity    - Equity curve & drawdown\n"
+            "  /trades    - Recent trade history\n"
+            "  /pnl [7]   - Daily P&L breakdown\n"
+            "  /signals   - Current signal scores\n"
+            "  /symbols   - Active symbols + spreads\n\n"
+            "CONTROL\n"
+            "  /kill      - Emergency stop all trading\n"
+            "  /resume    - Resume after kill switch\n"
+            "  /close [sym] - Close position(s)\n"
+            "  /cooldown [5] - Pause trading N minutes\n"
+            "  /mode <profile> - Switch risk profile\n\n"
+            "POSITION\n"
+            "  /sl <sym> <price> - Move stop-loss\n"
+            "  /tp <sym> <price> - Move take-profit\n\n"
+            "NOTIFICATIONS\n"
+            "  /notify [on|off] - Toggle trade notifications\n"
+            "  /alert [dd|trade|all] [on|off] - Fine-grained alerts\n\n"
+            "CONFIG\n"
+            "  /config    - View current settings\n"
+            "  /grid      - Multigrid status\n\n"
+            "FINANCE\n"
+            "  /cashout [amount] - Withdraw profits to cold wallet\n"
+            "  /wallet    - Cold wallet info + history\n"
+            "  /backtest [sym] [days] - Quick backtest report"
         )
 
     # --- Alert sending ---
@@ -293,8 +868,7 @@ class TelegramBot:
 
     async def alert(self, alert_type: str, message: str) -> None:
         """Send an alert with cooldown to prevent spam."""
-        import time
-        now = time.time()
+        now = _time.time()
         last = self._last_alert.get(alert_type, 0)
         if now - last < self._alert_cooldown_s:
             return
@@ -307,6 +881,10 @@ class TelegramBot:
 
     async def alert_drawdown(self, dd_pct: float) -> None:
         """Alert on significant drawdown."""
+        tg = self.config.get("telegram", {})
+        alerts = tg.get("alerts", {})
+        if not alerts.get("drawdown", True):
+            return
         await self.alert("drawdown", f"Drawdown: {dd_pct:.2f}%\nEquity: ${self.state.equity:.2f}")
 
     async def alert_trade(self, trade_result) -> None:
