@@ -188,6 +188,7 @@ class BacktestEngine:
         # Load profile
         self.profile_name = profile
         p = PROFILES.get(profile, PROFILES["conservative"])
+        self._profile = p  # store full profile dict for trail_activation_R etc.
         self._risk_pct = p["risk_pct"]
         self._max_risk_usd = p["max_risk_usd"]
         self._equity_cap_mult = p["equity_cap_mult"]
@@ -462,19 +463,34 @@ class BacktestEngine:
             if current_R >= self._breakeven_R and pos.stop_price > pos.entry_price:
                 pos.stop_price = pos.entry_price - tick_size
 
-        # Trailing stop
+        # Trailing stop - only activate after reaching minimum profit
+        # This prevents small winners from being stopped out too early
         rng_buf = self._recent_ranges.get(symbol)
         avg_range = np.mean(rng_buf.get()) if rng_buf and len(rng_buf) > 0 else 100
         trail_distance = avg_range * self._trail_pct
 
+        # Calculate current R-multiple
         if pos.side == Side.BUY:
-            new_stop = pos.peak_favorable - trail_distance
-            if new_stop > pos.stop_price:
-                pos.stop_price = new_stop
+            r_distance = pos.entry_price - pos.stop_price if pos.stop_price < pos.entry_price else avg_range * 0.5
+            current_profit = pos.peak_favorable - pos.entry_price
         else:
-            new_stop = pos.peak_favorable + trail_distance
-            if new_stop < pos.stop_price:
-                pos.stop_price = new_stop
+            r_distance = pos.stop_price - pos.entry_price if pos.stop_price > pos.entry_price else avg_range * 0.5
+            current_profit = pos.entry_price - pos.peak_favorable
+
+        current_R = current_profit / r_distance if r_distance > 0 else 0
+
+        # Only start trailing after reaching trail_activation_R (default 0.5R)
+        trail_activation_R = self._profile.get("trail_activation_R", 0.5) if self._profile else 0.5
+
+        if current_R >= trail_activation_R:
+            if pos.side == Side.BUY:
+                new_stop = pos.peak_favorable - trail_distance
+                if new_stop > pos.stop_price:
+                    pos.stop_price = new_stop
+            else:
+                new_stop = pos.peak_favorable + trail_distance
+                if new_stop < pos.stop_price:
+                    pos.stop_price = new_stop
 
     def _take_partial(self, symbol: str, price: float, ts: int) -> None:
         """Take profit on half the position at 1R."""

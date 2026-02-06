@@ -24,7 +24,8 @@ PROFILES: Dict[str, Dict[str, Any]] = {
         "equity_cap_mult": 2,    # cap compounding at 2x initial
         "sl_range_mult": 0.50,   # proven SL distance for 1m candles
         "tp_range_mult": 1.30,   # R:R = 2.6:1
-        "trail_pct": 0.30,       # moderate trail
+        "trail_pct": 0.40,       # wider trail — let winners run
+        "trail_activation_R": 0.6,  # only trail after 0.6R profit
         "cooldown_ms": 60_000,   # 1 minute between entries
         "max_hold": 15,          # 15 candle max hold
         "max_daily_R": 10,       # daily loss limit
@@ -43,7 +44,8 @@ PROFILES: Dict[str, Dict[str, Any]] = {
         "equity_cap_mult": 3,    # moderate compounding
         "sl_range_mult": 0.50,   # proven SL distance
         "tp_range_mult": 1.60,   # R:R = 3.2:1
-        "trail_pct": 0.25,       # tighter trail
+        "trail_pct": 0.38,       # wider trail (was 0.25)
+        "trail_activation_R": 0.5,  # only trail after 0.5R profit
         "cooldown_ms": 45_000,   # 45s cooldown
         "max_hold": 12,
         "max_daily_R": 15,
@@ -60,9 +62,10 @@ PROFILES: Dict[str, Dict[str, Any]] = {
         "risk_pct": 0.025,       # 2.5% risk per trade
         "max_risk_usd": 40.0,
         "equity_cap_mult": 4,    # compound up to 4x
-        "sl_range_mult": 0.50,   # proven SL — R:R = 3.2:1
-        "tp_range_mult": 1.60,   # wider TP than before (was 1.20)
-        "trail_pct": 0.22,       # tight trail to lock profit
+        "sl_range_mult": 0.35,   # tighter SL (was 0.50) — smaller losses
+        "tp_range_mult": 1.40,   # TP at 4:1 R:R
+        "trail_pct": 0.30,       # trail at 30% of range
+        "trail_activation_R": 0.3,  # start trailing after 0.3R — balanced
         "cooldown_ms": 30_000,   # 30s cooldown
         "max_hold": 12,
         "max_daily_R": 20,
@@ -72,7 +75,7 @@ PROFILES: Dict[str, Dict[str, Any]] = {
         "alpha": 4,
         "conf_scale": True,
         "breakeven_R": 999,      # disabled — early BE chops winners
-        "partial_tp": False,     # NEVER — was killing edge (-$2.57 avg loss vs $1.74 avg win)
+        "partial_tp": False,     # NEVER — was killing edge
         "min_signals": 3,        # wide entry
     },
     "ultra": {
@@ -81,7 +84,8 @@ PROFILES: Dict[str, Dict[str, Any]] = {
         "equity_cap_mult": 6,    # heavy compounding
         "sl_range_mult": 0.50,   # proven SL — R:R = 4:1
         "tp_range_mult": 2.00,   # widest TP
-        "trail_pct": 0.20,       # tightest trail
+        "trail_pct": 0.35,       # wider trail (was 0.20)
+        "trail_activation_R": 0.5,  # only trail after 0.5R profit
         "cooldown_ms": 20_000,   # 20s cooldown
         "max_hold": 12,
         "max_daily_R": 30,
@@ -117,7 +121,8 @@ PROFILES: Dict[str, Dict[str, Any]] = {
         "equity_cap_mult": 3,    # compound up to 3x initial (max $150 effective)
         "sl_range_mult": 0.50,   # proven SL distance — never go tighter
         "tp_range_mult": 1.80,   # R:R = 3.6:1 (wider than aggressive for variance)
-        "trail_pct": 0.18,       # tight trail — lock profits at 18% of range
+        "trail_pct": 0.40,       # wider trail (was 0.18) — let winners run
+        "trail_activation_R": 0.5,  # only trail after 0.5R profit
         "cooldown_ms": 45_000,   # 45s cooldown — prevents overtrading
         "max_hold": 10,          # 10 candle max hold — reduces overnight risk
         "max_daily_R": 6,        # max $6 daily loss = 12% of equity
@@ -160,6 +165,7 @@ def apply_profile(config: dict, profile_name: str) -> None:
     config["profile"] = {
         "name": profile_name,
         "trail_pct": p["trail_pct"],
+        "trail_activation_R": p.get("trail_activation_R", 0.5),  # only trail after this R-multiple
         "breakeven_R": p["breakeven_R"],
         "partial_tp": p["partial_tp"],
         "conf_scale": p["conf_scale"],

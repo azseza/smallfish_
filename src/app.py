@@ -454,7 +454,11 @@ async def main() -> None:
 
         if state.positions:
             log.warning("Flattening %d open positions...", len(state.positions))
-            await oco.flatten_all(state.positions)
+            failed = await oco.flatten_all(state.positions)
+            if failed:
+                log.critical("CRITICAL: Failed to flatten positions on shutdown: %s - CHECK EXCHANGE MANUALLY!", failed)
+                if telegram:
+                    await telegram.send_message(f"⚠️ CRITICAL: Failed to close positions on shutdown: {failed}")
 
         if dashboard:
             dashboard.stop()
@@ -654,8 +658,16 @@ async def try_enter(
             tp_price=tp_price,
         )
 
-        # Attach TP/SL
-        await oco.attach(pos)
+        # Attach TP/SL - CRITICAL: if this fails, close position immediately
+        oco_success = await oco.attach(pos)
+        if not oco_success:
+            log.error("OCO attach failed for %s - closing position to avoid naked exposure", symbol)
+            close_success = await oco.market_flatten(pos)
+            if close_success:
+                state.on_exit(symbol, estimated_price, "oco_failed")
+            else:
+                log.critical("CRITICAL: Failed to close position %s after OCO failure - MANUAL INTERVENTION REQUIRED", symbol)
+            return
 
         # Mark on dashboard
         if dashboard:
@@ -750,7 +762,9 @@ async def process_private_event(
                             state.slip_breaches, slip, symbol)
                 if state.slip_breaches >= config.get("kill_switch_slip_breaches", 3):
                     state.trigger_kill_switch("slippage_breaches")
-                    await oco.flatten_all(state.positions)
+                    failed = await oco.flatten_all(state.positions)
+                    if failed:
+                        log.critical("CRITICAL: Kill switch failed to flatten: %s", failed)
 
         persistence.log_order({
             "order_id": order_id,
