@@ -132,6 +132,35 @@ class OrderRouter:
         log.info("Market close: %s %s qty=%.6f -> %s", side.name, symbol, qty, result.order_id)
         return result.order_id or None
 
+    async def place_limit(
+        self,
+        symbol: str,
+        side: Side,
+        qty: float,
+        price: float,
+        reduce_only: bool = False,
+    ) -> Optional[str]:
+        """Place a simple GTC limit order (for grid orders).
+
+        Unlike enter(), this doesn't do reprice/timeout logic.
+        """
+        tick_size = self.config.get("tick_sizes", {}).get(symbol, 0.01)
+        price = tick_round(price, tick_size)
+
+        result = await self.rest.place_order(
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            price=price,
+            order_type=OrderType.LIMIT,
+            time_in_force=TimeInForce.GTC,
+            reduce_only=reduce_only,
+        )
+        if result.order_id:
+            log.info("Grid limit: %s %s qty=%.6f @ %.2f -> %s",
+                     side.name, symbol, qty, price, result.order_id)
+        return result.order_id or None
+
     async def cancel(self, symbol: str, order_id: str) -> bool:
         result = await self.rest.cancel_order(symbol, order_id)
         return result.success

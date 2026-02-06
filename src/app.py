@@ -132,6 +132,13 @@ async def main() -> None:
         config.setdefault("email", {})["enabled"] = True
 
     # --- Initialize Components ---
+    # If --equity is provided, use it as the effective trading capital
+    # This caps position sizing even if wallet has more funds
+    if args.equity:
+        config["initial_equity"] = float(args.equity)
+        config["equity_override"] = float(args.equity)
+        log.info("Equity override from CLI: $%.2f", args.equity)
+
     state = RuntimeState(config)
     persistence = Persistence()
     rest = create_rest(exchange, api_key, api_secret, testnet=testnet)
@@ -179,10 +186,20 @@ async def main() -> None:
     try:
         wallet = await rest.get_wallet_balance()
         if wallet.equity > 0:
-            state.equity = wallet.equity
-            state.peak_equity = wallet.equity
-            state.daily_start_equity = wallet.equity
-            log.info("Account equity: $%.2f USDT", wallet.equity)
+            # Respect --equity override: use min(wallet, override) for risk management
+            equity_override = config.get("equity_override")
+            if equity_override and equity_override > 0:
+                effective_equity = min(wallet.equity, equity_override)
+                log.info("Wallet: $%.2f USDT | Using: $%.2f (--equity cap)",
+                         wallet.equity, effective_equity)
+            else:
+                effective_equity = wallet.equity
+                log.info("Account equity: $%.2f USDT", wallet.equity)
+
+            state.equity = effective_equity
+            state.peak_equity = effective_equity
+            state.daily_start_equity = effective_equity
+            config["initial_equity"] = effective_equity  # for sqrt-compounding
         else:
             log.warning("Wallet returned zero equity — check API keys / account type")
 
@@ -213,14 +230,19 @@ async def main() -> None:
     if args.backfill:
         from backtest import backfill_trades, print_report
         bt_profile = args.mode or "aggressive"
-        # Use the real wallet equity (fetched above), not --equity arg
-        bt_equity = state.equity if state.equity > 1 else args.equity
+        # Use --equity arg for backfill (simulates starting with that amount)
+        # IMPORTANT: args.equity is the backtest starting capital, NOT wallet balance
+        bt_equity = float(args.equity)  # explicit float conversion
         log.info("Backfilling 7-day performance (profile=%s, equity=$%.2f)...",
                  bt_profile, bt_equity)
         bt_trades, bt_report = await backfill_trades(
             symbols, config, days=7,
             equity=bt_equity, profile=bt_profile,
         )
+        # Verify the report shows correct initial equity
+        if bt_report and bt_report.get("initial_equity") != bt_equity:
+            log.warning("Backfill equity mismatch: expected $%.2f, got $%.2f",
+                        bt_equity, bt_report.get("initial_equity", 0))
         for t in bt_trades:
             state.completed_trades.append(t)
         log.info("Backfilled %d trades into dashboard 7D history", len(bt_trades))
@@ -317,7 +339,8 @@ async def main() -> None:
             for prv_evt in ws.drain_private():
                 await process_private_event(prv_evt, state, config, books,
                                             oco, persistence, rest,
-                                            telegram=telegram, email_alerter=email_alerter)
+                                            telegram=telegram, email_alerter=email_alerter,
+                                            grid=grid)
 
             # 3. Manage open positions
             for sym in symbols:
@@ -339,11 +362,29 @@ async def main() -> None:
                             state.vol_regime,
                             time_now_ms(),
                         )
+                        # Place pending grid orders (entry levels)
                         for level in grid.pending_orders(sym):
-                            order_id = await router.enter(
-                                sym, level.side, level.quantity, book)
+                            order_id = await router.place_limit(
+                                sym, level.side, level.quantity, level.price)
                             if order_id:
                                 grid.mark_order(sym, level.price, level.side, order_id)
+                                state.grid_order_ids.add(order_id)
+
+                        # Place harvest orders (take-profit for filled levels)
+                        for level in grid.harvest_orders(sym):
+                            # Harvest = opposite side at pair_price
+                            harvest_side = Side.SELL if level.side == Side.BUY else Side.BUY
+                            harvest_price = level.pair_price
+                            harvest_id = await router.place_limit(
+                                sym, harvest_side, level.quantity, harvest_price,
+                                reduce_only=False)  # not reduce_only - grid accumulates
+                            if harvest_id:
+                                state.grid_order_ids.add(harvest_id)
+                                state.grid_harvest_ids[harvest_id] = level.order_id
+                                # Clear pair_price to prevent re-placing
+                                level.pair_price = 0.0
+                                log.info("GRID HARVEST ORDER: %s %s @ %.2f for level %s",
+                                         harvest_side.name, sym, harvest_price, level.order_id)
 
             # 5. Housekeeping
             state.update_latency(ws.latency_estimate_ms())
@@ -365,13 +406,22 @@ async def main() -> None:
                     wallet = await rest.get_wallet_balance()
                     if wallet.equity > 0:
                         old_eq = state.equity
-                        state.equity = wallet.equity
-                        if wallet.equity > state.peak_equity:
-                            state.peak_equity = wallet.equity
-                        drift = wallet.equity - old_eq
+                        # Respect --equity override during sync
+                        equity_override = config.get("equity_override")
+                        if equity_override and equity_override > 0:
+                            # Don't sync above the override cap
+                            # But DO track actual PnL changes within the cap
+                            new_equity = min(wallet.equity, equity_override)
+                        else:
+                            new_equity = wallet.equity
+
+                        state.equity = new_equity
+                        if new_equity > state.peak_equity:
+                            state.peak_equity = new_equity
+                        drift = new_equity - old_eq
                         if abs(drift) > 0.001:
                             log.debug("Equity synced: $%.2f -> $%.2f (drift $%+.4f)",
-                                      old_eq, wallet.equity, drift)
+                                      old_eq, new_equity, drift)
                 except Exception:
                     pass  # non-critical; will retry next interval
 
@@ -486,7 +536,6 @@ async def process_public_event(
 
     # Compute quality gate
     can, reason = risk.can_trade(state, book, sym)
-    quality_gate = 1.0 if can else 0.0
 
     # Compute signal scores
     scores = fuse.score_all(f, config)
@@ -496,18 +545,40 @@ async def process_public_event(
     signal_edges = heartbeat.get_signal_edges()
     weights = fuse.get_weights(config, signal_edges, config.get("adaptive", {}))
 
-    # Fuse into decision
-    direction, conf, raw = fuse.decide(
-        scores, weights, config.get("alpha", 5), quality_gate,
+    # Fuse into decision — compute RAW confidence first (for dashboard display)
+    # Then apply quality gate only for trading decision
+    direction_raw, conf_raw, raw = fuse.decide(
+        scores, weights, config.get("alpha", 5), quality_gate=1.0,
         min_signals=config.get("min_signals", 0),
     )
-    state.last_direction = direction
-    state.last_confidence = conf
+
+    # Store raw values for dashboard (shows signal strength even when can't trade)
+    state.last_direction = direction_raw
+    state.last_confidence = conf_raw
     state.last_raw = raw
+    state.last_symbol = sym  # track which symbol these scores belong to
+
+    # Store per-symbol scores for multi-coin dashboard
+    from core.utils import time_now_ms as _tnm
+    state.scores_by_symbol[sym] = {
+        "scores": dict(scores),
+        "conf": conf_raw,
+        "direction": direction_raw,
+        "raw": raw,
+        "ts": _tnm(),
+    }
+
+    # Apply quality gate for actual trading decision
+    if not can:
+        conf_gated = 0.0
+        direction = 0
+    else:
+        conf_gated = conf_raw
+        direction = direction_raw
 
     # Attempt entry (always, regardless of log_decisions)
-    if can and state.no_position(sym) and direction != 0 and conf >= config.get("C_enter", 0.65):
-        await try_enter(sym, direction, conf, book, tape, state, config,
+    if can and state.no_position(sym) and direction != 0 and conf_gated >= config.get("C_enter", 0.65):
+        await try_enter(sym, direction, conf_gated, book, tape, state, config,
                         router, oco, scores, persistence,
                         dashboard=dashboard)
 
@@ -516,7 +587,7 @@ async def process_public_event(
         decision_data = {
             "symbol": sym,
             "direction": direction,
-            "confidence": round(conf, 4),
+            "confidence": round(conf_raw, 4),
             "raw_score": round(raw, 4),
             "spread_ticks": round(book.spread_ticks(), 2),
             "mid_price": round(book.mid_price(), 2),
@@ -612,6 +683,7 @@ async def process_private_event(
     rest=None,
     telegram=None,
     email_alerter=None,
+    grid=None,
 ) -> None:
     """Handle private WS events: order fills, position updates.
 
@@ -625,6 +697,44 @@ async def process_private_event(
         exec_qty = float(data.quantity)
         side_str = data.side.name if isinstance(data.side, Side) else str(data.side)
         order_type = data.order_type
+        order_id = data.order_id
+
+        # --- Grid fill handling ---
+        if grid and order_id in state.grid_order_ids:
+            # Check if this is a harvest order fill
+            if order_id in state.grid_harvest_ids:
+                # Find the original level and record harvest PnL
+                orig_order_id = state.grid_harvest_ids.pop(order_id)
+                state.grid_order_ids.discard(order_id)
+                # Find the level by original order_id
+                gs = grid.grids.get(symbol)
+                if gs:
+                    for lv in gs.levels:
+                        if lv.order_id == orig_order_id and lv.is_filled:
+                            pnl = grid.on_harvest(symbol, lv, exec_price)
+                            state.equity += pnl  # credit grid PnL
+                            log.info("GRID HARVEST COMPLETE: %s pnl=%.4f equity=%.2f",
+                                     symbol, pnl, state.equity)
+                            persistence.log_trade({
+                                "symbol": symbol,
+                                "side": lv.side.name,
+                                "entry_price": lv.fill_price,
+                                "exit_price": exec_price,
+                                "quantity": lv.quantity,
+                                "pnl": round(pnl, 6),
+                                "pnl_R": 0.0,  # grid trades don't use R-multiple
+                                "duration_ms": 0,
+                                "exit_reason": "grid_harvest",
+                            })
+                            break
+            else:
+                # Initial grid level fill
+                state.grid_order_ids.discard(order_id)
+                filled_level = grid.on_fill(symbol, exec_price, data.side, order_id)
+                if filled_level:
+                    log.info("GRID LEVEL FILLED: %s %s @ %.2f -> harvest target %.2f",
+                             data.side.name, symbol, exec_price, filled_level.pair_price)
+            return  # don't process as regular order
 
         # Check for slippage on entry fills
         pos = state.position(symbol)
@@ -643,7 +753,7 @@ async def process_private_event(
                     await oco.flatten_all(state.positions)
 
         persistence.log_order({
-            "order_id": data.order_id,
+            "order_id": order_id,
             "symbol": symbol,
             "side": side_str,
             "type": order_type,

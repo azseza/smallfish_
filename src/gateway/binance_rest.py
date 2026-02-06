@@ -196,6 +196,7 @@ class BinanceREST(ExchangeREST):
         stop_loss: Optional[float] = None,
         trailing_stop: Optional[float] = None,
         position_idx: int = 0,
+        position_side: Optional[Side] = None,  # explicit close side for Binance
     ) -> OrderResponse:
         """Emulate Bybit's set_trading_stop by placing separate stop orders.
 
@@ -203,6 +204,11 @@ class BinanceREST(ExchangeREST):
         - TAKE_PROFIT_MARKET for TP
         - STOP_MARKET for SL
         and track their IDs for cleanup_bracket.
+
+        Args:
+            position_side: The side of the POSITION (not the close order).
+                          BUY position → close with SELL
+                          SELL position → close with BUY
         """
         existing = self._tp_sl_orders.get(symbol, {})
 
@@ -215,23 +221,28 @@ class BinanceREST(ExchangeREST):
         bracket = self._tp_sl_orders.setdefault(symbol, {})
         last_resp = OrderResponse(success=True)
 
+        # Determine close side: opposite of position side
+        # If position_side is BUY (long), close with SELL
+        # If position_side is SELL (short), close with BUY
+        if position_side is not None:
+            close_side = "SELL" if position_side == Side.BUY else "BUY"
+        elif take_profit is not None and stop_loss is not None:
+            # Fallback: infer from TP/SL relationship
+            # TP above SL = long position → close with SELL
+            close_side = "SELL" if take_profit > stop_loss else "BUY"
+        else:
+            # No way to infer, default to SELL (assumes long)
+            close_side = "SELL"
+            log.warning("set_trading_stop: no position_side provided, defaulting to SELL")
+
         if take_profit is not None:
             tp_params: Dict[str, str] = {
                 "symbol": symbol,
-                "side": "SELL",  # will be overridden by position
+                "side": close_side,
                 "type": "TAKE_PROFIT_MARKET",
                 "stopPrice": _fmt(take_profit),
                 "closePosition": "true",
             }
-            # Determine side from stop price relative to take profit
-            # TP above current = long position → close with SELL
-            # TP below current = short position → close with BUY
-            if stop_loss is not None:
-                if take_profit > stop_loss:
-                    tp_params["side"] = "SELL"  # long position
-                else:
-                    tp_params["side"] = "BUY"   # short position
-
             data = await self._request("POST", "/fapi/v1/order", tp_params)
             resp = self._to_order_response(data)
             if resp.success:
@@ -241,20 +252,11 @@ class BinanceREST(ExchangeREST):
         if stop_loss is not None:
             sl_params: Dict[str, str] = {
                 "symbol": symbol,
-                "side": "SELL",
+                "side": close_side,
                 "type": "STOP_MARKET",
                 "stopPrice": _fmt(stop_loss),
                 "closePosition": "true",
             }
-            if take_profit is not None:
-                if take_profit > stop_loss:
-                    sl_params["side"] = "SELL"  # long position → SL sells
-                else:
-                    sl_params["side"] = "BUY"   # short position → SL buys
-            elif existing.get("tp"):
-                # Infer from existing TP
-                pass
-
             data = await self._request("POST", "/fapi/v1/order", sl_params)
             resp = self._to_order_response(data)
             if resp.success:

@@ -98,6 +98,9 @@ class Position:
     tp_order_id: str = ""
     trail_active: bool = False
     peak_favorable: float = 0.0  # best price seen (for trailing)
+    worst_adverse: float = 0.0   # worst price seen (for MAE)
+    signals_at_entry: dict = field(default_factory=dict)  # scores at entry time
+    confidence_at_entry: float = 0.0
 
     @property
     def notional(self) -> float:
@@ -106,6 +109,19 @@ class Position:
     def mark_to_market(self, current_price: float) -> float:
         pnl = (current_price - self.entry_price) * self.quantity * int(self.side)
         self.unrealized_pnl = pnl
+
+        # Track peak favorable (for MFE) and worst adverse (for MAE)
+        if self.side == Side.BUY:
+            if current_price > self.peak_favorable:
+                self.peak_favorable = current_price
+            if self.worst_adverse == 0 or current_price < self.worst_adverse:
+                self.worst_adverse = current_price
+        else:  # SELL
+            if self.peak_favorable == 0 or current_price < self.peak_favorable:
+                self.peak_favorable = current_price
+            if current_price > self.worst_adverse:
+                self.worst_adverse = current_price
+
         return pnl
 
 

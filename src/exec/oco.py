@@ -20,7 +20,7 @@ class OcoManager:
         self.config = config
 
     async def attach(self, position: Position) -> None:
-        """Attach TP and SL to a new position via Bybit trading-stop API."""
+        """Attach TP and SL to a new position via exchange trading-stop API."""
         if position.tp_price <= 0 or position.stop_price <= 0:
             log.warning("Cannot attach OCO: missing TP or SL price")
             return
@@ -29,6 +29,7 @@ class OcoManager:
             symbol=position.symbol,
             take_profit=position.tp_price,
             stop_loss=position.stop_price,
+            position_side=position.side,  # pass position side for Binance
         )
         if result.success:
             log.info("OCO attached: %s TP=%.2f SL=%.2f",
@@ -85,6 +86,7 @@ class OcoManager:
         result = await self.rest.set_trading_stop(
             symbol=position.symbol,
             stop_loss=new_stop,
+            position_side=position.side,  # pass position side for Binance
         )
         if result.success:
             old_stop = position.stop_price

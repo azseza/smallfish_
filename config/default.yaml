@@ -167,15 +167,17 @@ adaptive:
   update_interval_trades: 50         # re-evaluate every N trades
 
 # --- Multigrid Strategy (optional, activate with --multigrid) ---
+# Grid profits from price oscillation. Each round-trip captures ~spacing profit.
+# Net profit ≈ spacing - 2*fees. With 0.02% maker fees, need spacing > 0.05% to profit.
 multigrid:
   enabled: false
-  levels: 5                          # grid levels per side (5 buys + 5 sells)
-  spacing_pct: 0.001                 # 0.1% between levels
-  qty_per_level_pct: 0.01            # 1% of equity per grid level
-  max_open_levels: 10                # max pending grid orders at once
-  bias_strength: 0.5                 # how much signal fusion shifts the grid center
-  recalc_interval_ms: 60000          # recalculate grid every 60s
-  harvest_pct: 0.001                 # min 0.1% profit to harvest a grid pair
+  levels: 4                          # grid levels per side (4 buys + 4 sells)
+  spacing_pct: 0.003                 # 0.3% between levels (net ~0.26% after fees)
+  qty_per_level_pct: 0.015           # 1.5% of equity per grid level
+  max_open_levels: 8                 # max pending grid orders at once
+  bias_strength: 0.6                 # how much signal fusion shifts the grid center
+  recalc_interval_ms: 120000         # recalculate grid every 2 min (less churn)
+  harvest_pct: 0.002                 # min 0.2% profit to harvest a grid pair
   regime_filter: true                # disable grid in extreme volatility
 
 # --- Terminal Dashboard (optional, activate with --dashboard) ---

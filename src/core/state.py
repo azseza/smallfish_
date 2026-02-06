@@ -47,11 +47,19 @@ class RuntimeState:
         self.positions: Dict[str, Position] = {}  # symbol → Position
         self.active_orders: Dict[str, Order] = {}  # order_id → Order
 
+        # --- Grid order tracking ---
+        self.grid_order_ids: set[str] = set()  # order IDs that belong to grid strategy
+        self.grid_harvest_ids: Dict[str, str] = {}  # harvest_order_id → original_level_order_id
+
         # --- Signal state ---
         self.last_scores: dict = {}
         self.last_raw: float = 0.0
         self.last_confidence: float = 0.0
         self.last_direction: int = 0         # +1 long, -1 short, 0 flat
+        self.last_symbol: str = ""           # symbol for last_scores (focused coin)
+
+        # Per-symbol scores for multi-coin mode
+        self.scores_by_symbol: Dict[str, dict] = {}  # symbol → {scores, conf, direction, raw, ts}
 
         # --- Latency ---
         self.latency_ms: int = 0
@@ -161,6 +169,9 @@ class RuntimeState:
             tp_price=tp_price,
             entry_time=time_now_ms(),
             peak_favorable=fill_price,
+            worst_adverse=fill_price,
+            signals_at_entry=dict(scores),  # capture at entry, not exit
+            confidence_at_entry=confidence,
         )
         self.positions[symbol] = pos
         self.last_entry_ts[symbol] = time_now_ms()
@@ -180,6 +191,16 @@ class RuntimeState:
         risk_per_trade = max(risk_per_trade, 0.01)
         pnl_R = raw_pnl / risk_per_trade
 
+        # Calculate MAE (max adverse excursion) and MFE (max favorable excursion)
+        # MAE = worst price seen relative to entry (negative = adverse)
+        # MFE = best price seen relative to entry (positive = favorable)
+        if pos.side == Side.BUY:
+            mae = (pos.worst_adverse - pos.entry_price) * pos.quantity if pos.worst_adverse else 0.0
+            mfe = (pos.peak_favorable - pos.entry_price) * pos.quantity if pos.peak_favorable else 0.0
+        else:
+            mae = (pos.entry_price - pos.worst_adverse) * pos.quantity if pos.worst_adverse else 0.0
+            mfe = (pos.entry_price - pos.peak_favorable) * pos.quantity if pos.peak_favorable else 0.0
+
         result = TradeResult(
             symbol=symbol,
             side=pos.side,
@@ -193,8 +214,10 @@ class RuntimeState:
             duration_ms=now - pos.entry_time,
             slippage_entry=slippage_entry,
             slippage_exit=slippage_exit,
-            signals_at_entry=dict(self.last_scores),
+            signals_at_entry=pos.signals_at_entry,  # use stored entry signals
             exit_reason=exit_reason,
+            mae=mae,
+            mfe=mfe,
         )
         self.completed_trades.append(result)
 

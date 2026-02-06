@@ -927,8 +927,11 @@ async def backfill_trades(symbols: list[str], config: dict, days: int = 7,
     Returns (trades, report_dict).
     """
     import copy
+    # CRITICAL: Create isolated config copy and set initial_equity explicitly
     bt_config = copy.deepcopy(config)
-    bt_config["initial_equity"] = equity
+    bt_config["initial_equity"] = float(equity)  # explicit float to avoid any type issues
+    log.info("  Backfill: using initial_equity=$%.2f (passed equity=$%.2f)",
+             bt_config["initial_equity"], equity)
 
     exchange = bt_config.get("exchange", "bybit")
 
@@ -1043,7 +1046,7 @@ if __name__ == "__main__":
     parser.add_argument("--days", type=int, default=30, help="Number of days to backtest")
     parser.add_argument("--equity", type=float, default=50.0, help="Initial equity in USD")
     parser.add_argument("--mode", default="aggressive",
-                        choices=["conservative", "balanced", "aggressive", "ultra"],
+                        choices=["conservative", "balanced", "aggressive", "ultra", "starter_50"],
                         help="Risk profile")
     parser.add_argument("--sweep", action="store_true",
                         help="Run all profiles and compare")

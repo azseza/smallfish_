@@ -86,6 +86,7 @@ class ExchangeREST(ABC):
         stop_loss: Optional[float] = None,
         trailing_stop: Optional[float] = None,
         position_idx: int = 0,
+        position_side: Optional[Side] = None,  # for Binance: explicit close side
     ) -> OrderResponse: ...
 
     @abstractmethod
