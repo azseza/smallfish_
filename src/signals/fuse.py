@@ -185,7 +185,7 @@ def count_agreement(scores: dict, direction: int) -> int:
     if direction == 0:
         return 0
 
-    threshold = 0.05
+    threshold = 0.10
 
     if direction == 1:
         pairs = [

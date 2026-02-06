@@ -137,7 +137,8 @@ microstructure:
   absorption_window_ms: 3000         # Absorption measurement window
 
 # --- Latency ---
-max_latency_ms: 80                   # won't trade if latency exceeds this
+max_latency_ms: 250                  # won't trade if latency exceeds this
+signal_throttle_ms: 100              # min ms between signal evaluations per symbol
 
 # --- Funding Window ---
 funding_window_minutes: 3            # avoid trading N minutes before/after funding

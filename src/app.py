@@ -325,30 +325,57 @@ async def main() -> None:
     # Track calendar day for daily reset
     _last_day = datetime.datetime.now(datetime.timezone.utc).date()
 
+    # Per-symbol signal throttle: only compute signals once per N ms per symbol
+    _signal_throttle_ms = config.get("signal_throttle_ms", 100)
+    _last_signal_ts: dict[str, int] = {sym: 0 for sym in symbols}
+
+    # Periodic REST book refresh: heal accumulated delta drift
+    _book_refresh_interval_ms = 30_000  # refresh each book every 30s via REST
+    _last_book_refresh: dict[str, int] = {sym: 0 for sym in symbols}
+
     # --- Main Event Loop ---
     try:
         while not state.kill_switch:
-            # 1. Process public events (book + trade updates)
-            evt = await ws.next_event(timeout_s=0.02)
-            if evt is not None:
-                await process_public_event(evt, books, tapes, state, config,
-                                           router, oco, persistence, heartbeat,
-                                           grid=grid, dashboard=dashboard)
+            # 1. FAST PATH: Drain all pending events — only update book/tape data.
+            #    No signal computation here. This keeps up with the WS event rate
+            #    even with 5+ symbols (~200-500 events/sec).
+            _dirty_syms: set[str] = set()
+            _drain_count = 0
+            while _drain_count < 500:
+                evt = await ws.next_event(timeout_s=0.005 if _drain_count > 0 else 0.02)
+                if evt is None:
+                    break
+                _drain_count += 1
+                updated = ingest_event(evt, books, tapes, dashboard=dashboard)
+                if updated:
+                    _dirty_syms.add(updated)
 
-            # 2. Process private events (order fills, position updates)
+            # 2. SLOW PATH: Signal computation — only for dirty symbols,
+            #    throttled to once per signal_throttle_ms per symbol.
+            now_ms = time_now_ms()
+            for sym in _dirty_syms:
+                if now_ms - _last_signal_ts.get(sym, 0) >= _signal_throttle_ms:
+                    _last_signal_ts[sym] = now_ms
+                    await evaluate_symbol(
+                        sym, books, tapes, state, config,
+                        router, oco, persistence, heartbeat,
+                        dashboard=dashboard,
+                    )
+
+            # 3. Process private events (order fills, position updates)
             for prv_evt in ws.drain_private():
                 await process_private_event(prv_evt, state, config, books,
                                             oco, persistence, rest,
                                             telegram=telegram, email_alerter=email_alerter,
                                             grid=grid)
 
-            # 3. Manage open positions
+            # 4. Manage open positions
             for sym in symbols:
                 if state.has_position(sym):
                     await manage_position(sym, state, books[sym], tapes[sym],
                                           config, oco, persistence)
 
-            # 4. Multigrid: place/manage grid orders
+            # 5. Multigrid: place/manage grid orders
             if grid and grid.enabled:
                 for sym in symbols:
                     book = books[sym]
@@ -386,19 +413,43 @@ async def main() -> None:
                                 log.info("GRID HARVEST ORDER: %s %s @ %.2f for level %s",
                                          harvest_side.name, sym, harvest_price, level.order_id)
 
-            # 5. Housekeeping
+            # 6. Housekeeping
             state.update_latency(ws.latency_estimate_ms())
             heartbeat.check()
             persistence.flush_if_needed()
 
-            # 5a. Daily reset at midnight UTC
+            # 6a. Book health: REST snapshot refresh
+            #     - Immediate: if book.needs_snapshot (crossed/seq gap), fetch NOW
+            #     - Periodic: refresh every 30s to heal silent drift
+            _now_bk = time_now_ms()
+            for sym in symbols:
+                b = books[sym]
+                need_immediate = b.needs_snapshot
+                need_periodic = (_now_bk - _last_book_refresh.get(sym, 0)) >= _book_refresh_interval_ms
+                if need_immediate or need_periodic:
+                    try:
+                        ob = await rest.get_orderbook(sym, b.depth)
+                        if ob and ob.get("b") and ob.get("a"):
+                            b.on_snapshot(ob["b"], ob["a"], ob.get("seq", 0))
+                            _last_book_refresh[sym] = _now_bk
+                            if need_immediate:
+                                log.info("Book healed via REST for %s", sym)
+                        else:
+                            # REST failed, fall back to WS resubscribe
+                            await ws.resubscribe_book(sym)
+                    except Exception as e:
+                        log.debug("REST book refresh failed for %s: %s", sym, e)
+                        if need_immediate:
+                            await ws.resubscribe_book(sym)
+
+            # 6b. Daily reset at midnight UTC
             today = datetime.datetime.now(datetime.timezone.utc).date()
             if today != _last_day:
                 state.reset_daily()
                 _last_day = today
                 log.info("Daily reset at midnight UTC")
 
-            # 5b. Periodic equity sync from exchange
+            # 6c. Periodic equity sync from exchange
             now_ms = time_now_ms()
             if now_ms - _last_equity_sync > _equity_sync_interval_s * 1000:
                 _last_equity_sync = now_ms
@@ -425,7 +476,7 @@ async def main() -> None:
                 except Exception:
                     pass  # non-critical; will retry next interval
 
-            # 6. Remote alerts on kill switch
+            # 7. Remote alerts on kill switch
             if state.kill_switch:
                 if telegram:
                     await telegram.alert_kill_switch(state.kill_reason)
@@ -476,27 +527,22 @@ async def main() -> None:
         log.info("Shutdown complete.")
 
 
-async def process_public_event(
+def ingest_event(
     evt: WsEvent,
     books: dict[str, OrderBook],
     tapes: dict[str, TradeTape],
-    state: RuntimeState,
-    config: dict,
-    router: OrderRouter,
-    oco: OcoManager,
-    persistence: Persistence,
-    heartbeat: Heartbeat,
-    grid=None,
     dashboard=None,
-) -> None:
-    """Handle a public WebSocket event: book update or trade."""
+) -> str | None:
+    """Fast path: update book/tape data. No signal computation.
+
+    Returns the symbol name if data was ingested, None if skipped.
+    """
     sym = evt.symbol
     book = books.get(sym)
     tape = tapes.get(sym)
     if not book or not tape:
-        return
+        return None
 
-    # Update market data
     if evt.event_type == EventType.BOOK_SNAPSHOT:
         data = evt.data
         book.on_snapshot(
@@ -504,7 +550,7 @@ async def process_public_event(
             data.get("a", []),
             data.get("seq", 0),
         )
-        return  # Don't trade on snapshots, wait for deltas
+        return sym
 
     elif evt.event_type == EventType.BOOK_DELTA:
         data = evt.data
@@ -513,17 +559,37 @@ async def process_public_event(
             data.get("a", []),
             data.get("seq", 0),
         )
+        return sym
 
     elif evt.event_type == EventType.TRADE:
         trade: Trade = evt.data
         tape.add_trade(trade)
-        # Feed trade price to dashboard (builds real OHLCV candles)
-        # Only feed the primary symbol to avoid mixing prices from
-        # different symbols (e.g. BTC 98k + DOGE 0.25 → broken Y-axis)
         if dashboard and sym == dashboard.chart_symbol:
             dashboard.add_price_point(trade.price, trade.quantity)
+        return sym
 
-    # --- Signal Pipeline (runs on every book delta and trade) ---
+    return None
+
+
+async def evaluate_symbol(
+    sym: str,
+    books: dict[str, OrderBook],
+    tapes: dict[str, TradeTape],
+    state: RuntimeState,
+    config: dict,
+    router: OrderRouter,
+    oco: OcoManager,
+    persistence: Persistence,
+    heartbeat: Heartbeat,
+    dashboard=None,
+) -> None:
+    """Slow path: signal computation + trade decision for one symbol.
+
+    Called at most once per signal_throttle_ms per symbol.
+    """
+    book = books[sym]
+    tape = tapes[sym]
+
     if not book.is_fresh():
         return
 
@@ -540,6 +606,8 @@ async def process_public_event(
 
     # Compute quality gate
     can, reason = risk.can_trade(state, book, sym)
+    if not can:
+        log.debug("GATE BLOCKED %s: %s", sym, reason)
 
     # Compute signal scores
     scores = fuse.score_all(f, config)
@@ -560,16 +628,15 @@ async def process_public_event(
     state.last_direction = direction_raw
     state.last_confidence = conf_raw
     state.last_raw = raw
-    state.last_symbol = sym  # track which symbol these scores belong to
+    state.last_symbol = sym
 
     # Store per-symbol scores for multi-coin dashboard
-    from core.utils import time_now_ms as _tnm
     state.scores_by_symbol[sym] = {
         "scores": dict(scores),
         "conf": conf_raw,
         "direction": direction_raw,
         "raw": raw,
-        "ts": _tnm(),
+        "ts": time_now_ms(),
     }
 
     # Apply quality gate for actual trading decision
@@ -580,13 +647,13 @@ async def process_public_event(
         conf_gated = conf_raw
         direction = direction_raw
 
-    # Attempt entry (always, regardless of log_decisions)
+    # Attempt entry
     if can and state.no_position(sym) and direction != 0 and conf_gated >= config.get("C_enter", 0.65):
         await try_enter(sym, direction, conf_gated, book, tape, state, config,
                         router, oco, scores, persistence,
                         dashboard=dashboard)
 
-    # Optional decision logging
+    # Optional decision logging (throttled along with signals — no spam)
     if config.get("log_decisions") and abs(raw) > 0.01:
         decision_data = {
             "symbol": sym,
@@ -596,6 +663,7 @@ async def process_public_event(
             "spread_ticks": round(book.spread_ticks(), 2),
             "mid_price": round(book.mid_price(), 2),
             "vol_regime": vol_name,
+            "gate_reason": reason if not can else "",
             "action": "enter" if state.has_position(sym) else "none",
         }
         decision_data.update({k: round(v, 4) for k, v in scores.items()})
@@ -629,7 +697,9 @@ async def try_enter(
     qty = risk.position_size(state, book, stop_distance, symbol,
                              confidence=confidence)
     if qty <= 0:
-        log.debug("Position size too small, skipping entry")
+        wr = state.rolling_win_rate(20)
+        log.info("ENTRY BLOCKED %s: position_size=0 (wr=%.2f, equity=%.2f, stop_dist=%.4f)",
+                 symbol, wr, state.equity, stop_distance)
         return
 
     log.info("ENTRY SIGNAL: %s %s conf=%.3f raw=%.4f qty=%.6f stop=%.2f tp=%.2f range=%.2f",
@@ -736,6 +806,8 @@ async def process_private_event(
                                 "pnl": round(pnl, 6),
                                 "pnl_R": 0.0,  # grid trades don't use R-multiple
                                 "duration_ms": 0,
+                                "duration_s": 0.0,
+                                "datetime": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                                 "exit_reason": "grid_harvest",
                             })
                             break
@@ -803,6 +875,8 @@ async def process_private_event(
                     "pnl": round(result.pnl, 6),
                     "pnl_R": round(result.pnl_R, 4),
                     "duration_ms": result.duration_ms,
+                    "duration_s": round(result.duration_ms / 1000, 2),
+                    "datetime": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                     "exit_reason": reason,
                 })
                 if telegram:
@@ -829,6 +903,8 @@ async def process_private_event(
                     "pnl": round(result.pnl, 6),
                     "pnl_R": round(result.pnl_R, 4),
                     "duration_ms": result.duration_ms,
+                    "duration_s": round(result.duration_ms / 1000, 2),
+                    "datetime": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                     "exit_reason": "position_closed",
                 })
                 if telegram:
@@ -887,18 +963,32 @@ async def manage_position(
                     "pnl": round(result.pnl, 6),
                     "pnl_R": round(result.pnl_R, 4),
                     "duration_ms": result.duration_ms,
+                    "duration_s": round(result.duration_ms / 1000, 2),
+                    "datetime": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                     "exit_reason": "max_hold",
                 })
             return
 
+    # Use per-symbol confidence, not the global last_confidence which could
+    # belong to a different symbol (overwritten by whichever symbol processed last)
+    sym_data = state.scores_by_symbol.get(symbol, {})
+    sym_confidence = sym_data.get("conf", 0.0) if sym_data else 0.0
+
+    # Check if we have fresh signal data for this symbol
+    # Without it, confidence defaults to 0.0 which would wrongly trigger exit
+    has_fresh_scores = bool(sym_data) and (time_now_ms() - sym_data.get("ts", 0)) < 30_000
+
     # Volatility-adapted trailing (matches backtest trailing logic)
     tick_size = config.get("tick_sizes", {}).get(symbol, 0.01)
     avg_range = risk.estimate_avg_range(tape, tick_size)
-    await oco.update_trailing(pos, current_price, state.last_confidence,
+    await oco.update_trailing(pos, current_price, sym_confidence,
                               avg_range=avg_range)
 
-    # Check confidence exit
-    should_exit = await oco.tighten_on_confidence_drop(pos, state.last_confidence)
+    # Check confidence exit — only if we have fresh signal data
+    # Otherwise conf=0.0 default would falsely trigger exit
+    should_exit = False
+    if has_fresh_scores:
+        should_exit = await oco.tighten_on_confidence_drop(pos, sym_confidence)
     if should_exit:
         await oco.market_flatten(pos)
         result = state.on_exit(symbol, current_price, "confidence_exit")
@@ -912,6 +1002,8 @@ async def manage_position(
                 "pnl": round(result.pnl, 6),
                 "pnl_R": round(result.pnl_R, 4),
                 "duration_ms": result.duration_ms,
+                "duration_s": round(result.duration_ms / 1000, 2),
+                "datetime": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                 "exit_reason": "confidence_exit",
             })
 

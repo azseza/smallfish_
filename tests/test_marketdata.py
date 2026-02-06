@@ -58,6 +58,54 @@ class TestOrderBook:
         # Empty book: spread=0-0=0, tick_size=0.1 → 0/0.1=0
         assert book.spread_ticks() == 0.0
 
+    def test_crossed_book_resets(self):
+        """A crossed book (bid >= ask) should trigger reset."""
+        book = OrderBook(symbol="TEST", depth=5, tick_size=0.01)
+        book.on_snapshot([[100, 1]], [[101, 1]], seq=1)
+        assert book.is_fresh()
+        # Force a crossed book via delta: bid jumps above ask
+        book.on_delta([[102, 1]], [], seq=2)
+        # Book should have been reset
+        assert book.last_update_ts == 0
+        assert book.needs_snapshot is True
+        assert not book.is_fresh()
+
+    def test_seq_gap_resets(self):
+        """A sequence gap should trigger reset."""
+        book = OrderBook(symbol="TEST", depth=5, tick_size=0.01)
+        book.on_snapshot([[100, 1]], [[101, 1]], seq=10)
+        assert book.is_fresh()
+        # Delta with gap: expected seq=11 but got 15
+        book.on_delta([[99, 1]], [], seq=15)
+        assert book.last_update_ts == 0
+        assert book.needs_snapshot is True
+
+    def test_warmup_after_reset(self):
+        """After reset + resnapshot, need WARMUP_DELTAS valid deltas."""
+        book = OrderBook(symbol="TEST", depth=5, tick_size=0.01)
+        book.on_snapshot([[100, 1]], [[101, 1]], seq=1)
+        assert book.is_fresh()
+        # Force crossed → reset
+        book.on_delta([[102, 1]], [], seq=2)
+        assert not book.is_fresh()
+        # Recovery snapshot — warmup_count = 0
+        book.on_snapshot([[100, 1]], [[101, 1]], seq=20)
+        assert not book.is_fresh()  # warmup not done
+        # Feed valid deltas
+        for i in range(OrderBook.WARMUP_DELTAS):
+            book.on_delta([[99.5 - i * 0.01, 0.5]], [], seq=21 + i)
+        assert book.is_fresh()  # now warmed up
+
+    def test_deltas_discarded_before_snapshot(self):
+        """After reset, deltas without a snapshot should be discarded."""
+        book = OrderBook(symbol="TEST", depth=5, tick_size=0.01)
+        book.on_snapshot([[100, 1]], [[101, 1]], seq=1)
+        book.on_delta([[102, 1]], [], seq=2)  # crosses → reset
+        assert book.needs_snapshot
+        # Deltas before snapshot should be discarded
+        book.on_delta([[99, 1]], [], seq=3)
+        assert book.last_update_ts == 0  # still reset
+
     def test_cancel_tracking(self, sample_book):
         # Remove a bid level — should be tracked as cancel
         sample_book.on_delta([[49999.9, 0]], [], seq=2)

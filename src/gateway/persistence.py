@@ -63,11 +63,12 @@ class Persistence:
         "obi_long", "obi_short", "prt_long", "prt_short",
         "umom_long", "umom_short", "ltb_long", "ltb_short",
         "sweep_up", "sweep_down", "ice_long", "ice_short",
-        "vwap_long", "vwap_short", "vol_regime",
+        "vwap_long", "vwap_short", "regime_long", "regime_short",
+        "vol_regime",
         "cvd_long", "cvd_short", "tps_long", "tps_short",
         "liq_long", "liq_short", "mvr_long", "mvr_short",
         "absorb_long", "absorb_short",
-        "spread_ticks", "mid_price", "action",
+        "spread_ticks", "mid_price", "gate_reason", "action",
     ]
 
     ORDER_HEADERS = [
@@ -77,8 +78,8 @@ class Persistence:
     ]
 
     TRADE_HEADERS = [
-        "timestamp", "symbol", "side", "entry_price", "exit_price",
-        "quantity", "pnl", "pnl_R", "duration_ms",
+        "timestamp", "datetime", "symbol", "side", "entry_price", "exit_price",
+        "quantity", "pnl", "pnl_R", "duration_ms", "duration_s",
         "slippage_entry", "slippage_exit", "exit_reason",
         "mae", "mfe",
     ]

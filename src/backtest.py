@@ -18,6 +18,7 @@ import math
 import os
 import sys
 import time
+from datetime import datetime as dt, timezone as tz
 from typing import List, Dict, Tuple, Optional
 
 import aiohttp
@@ -224,6 +225,9 @@ class BacktestEngine:
         # Per-symbol range tracker
         self._recent_ranges: Dict[str, RingBuffer] = {}
 
+        # Track initial stop price per symbol to detect trailing
+        self._initial_stop: Dict[str, float] = {}
+
 
     def init_symbol(self, symbol: str):
         tick_size = self.config.get("tick_sizes", {}).get(symbol, 0.01)
@@ -242,32 +246,30 @@ class BacktestEngine:
         book = self.books[symbol]
         tape = self.tapes[symbol]
 
-        # Apply delta for cancel tracking
-        if prev_kline and book.bids:
-            old_bids = list(book.bids[:3])
-            old_asks = list(book.asks[:3])
-
         # Build synthetic book
         new_book = build_synthetic_book(kline, prev_kline, tick_size)
 
+        now = time_now_ms()
+
+        # Track cancellations BEFORE snapshot (preserves PRT/ICE signal data)
+        # Levels that existed in old book but not in new = synthetic "cancels"
         if prev_kline and book.bids:
-            delta_bids = [[p, s] for p, s in new_book.bids]
-            delta_asks = [[p, s] for p, s in new_book.asks]
             new_bid_prices = {p for p, _ in new_book.bids}
             new_ask_prices = {p for p, _ in new_book.asks}
-            for p, s in old_bids:
-                if p not in new_bid_prices:
-                    delta_bids.append([p, 0])
-            for p, s in old_asks:
-                if p not in new_ask_prices:
-                    delta_asks.append([p, 0])
-            book.on_delta(delta_bids, delta_asks, seq=book.last_update_seq + 1)
-        else:
-            book.on_snapshot(
-                [[p, s] for p, s in new_book.bids],
-                [[p, s] for p, s in new_book.asks],
-                seq=book.last_update_seq + 1,
-            )
+            for p, s in book.bids:
+                if p not in new_bid_prices and s > 0:
+                    book._cancel_tracker.append((now, "bid", p, s))
+            for p, s in book.asks:
+                if p not in new_ask_prices and s > 0:
+                    book._cancel_tracker.append((now, "ask", p, s))
+
+        # Always use snapshot — delta approach causes crossed books in backtest
+        # because synthetic bid from new candle can exceed old candle's ask levels
+        book.on_snapshot(
+            [[p, s] for p, s in new_book.bids],
+            [[p, s] for p, s in new_book.asks],
+            seq=book.last_update_seq + 1,
+        )
 
         book.last_update_ts = kline["ts"]
 
@@ -391,6 +393,7 @@ class BacktestEngine:
         )
         self._hold_counter[symbol] = 0
         self._partial_taken[symbol] = False
+        self._initial_stop[symbol] = stop_price
 
         self.signal_log.append({
             "ts": kline["ts"],
@@ -420,32 +423,70 @@ class BacktestEngine:
             self._exit_position(symbol, close, "max_hold", kline["ts"])
             return
 
-        # Check stop loss hit
+        # Determine if SL was trailed (moved from original position)
+        initial_sl = self._initial_stop.get(symbol, pos.stop_price)
         if pos.side == Side.BUY:
-            if low <= pos.stop_price:
-                self._exit_position(symbol, pos.stop_price, "sl_hit", kline["ts"])
+            is_trailed = pos.stop_price > initial_sl + tick_size
+        else:
+            is_trailed = pos.stop_price < initial_sl - tick_size
+
+        sl_label = "trailing_sl" if is_trailed else "sl_hit"
+
+        # Check stop loss / take profit with proper intra-bar priority
+        # Convention: bullish candle path = open→low→high→close
+        #             bearish candle path = open→high→low→close
+        bullish = close >= kline["open"]
+
+        if pos.side == Side.BUY:
+            sl_hit = low <= pos.stop_price
+            tp_hit = high >= pos.tp_price
+
+            if sl_hit and tp_hit:
+                # Both hit in same candle — use candle direction to resolve
+                if bullish:
+                    # open→low→high→close: SL hit first (went low first)
+                    self._exit_position(symbol, pos.stop_price, sl_label, kline["ts"])
+                else:
+                    # open→high→low→close: TP hit first (went high first)
+                    self._exit_position(symbol, pos.tp_price, "tp_hit", kline["ts"])
                 return
+            if sl_hit:
+                self._exit_position(symbol, pos.stop_price, sl_label, kline["ts"])
+                return
+
             # Partial TP at 1R (half position)
             r_distance = pos.entry_price - pos.stop_price  # risk distance
             if self._partial_tp and not self._partial_taken.get(symbol, False):
                 partial_target = pos.entry_price + r_distance  # 1R target
                 if high >= partial_target:
                     self._take_partial(symbol, partial_target, kline["ts"])
-            if high >= pos.tp_price:
+            if tp_hit:
                 self._exit_position(symbol, pos.tp_price, "tp_hit", kline["ts"])
                 return
             if high > pos.peak_favorable:
                 pos.peak_favorable = high
         else:  # SHORT
-            if high >= pos.stop_price:
-                self._exit_position(symbol, pos.stop_price, "sl_hit", kline["ts"])
+            sl_hit = high >= pos.stop_price
+            tp_hit = low <= pos.tp_price
+
+            if sl_hit and tp_hit:
+                if bullish:
+                    # open→low→high→close: TP hit first (went low first)
+                    self._exit_position(symbol, pos.tp_price, "tp_hit", kline["ts"])
+                else:
+                    # open→high→low→close: SL hit first (went high first)
+                    self._exit_position(symbol, pos.stop_price, sl_label, kline["ts"])
                 return
+            if sl_hit:
+                self._exit_position(symbol, pos.stop_price, sl_label, kline["ts"])
+                return
+
             r_distance = pos.stop_price - pos.entry_price
             if self._partial_tp and not self._partial_taken.get(symbol, False):
                 partial_target = pos.entry_price - r_distance
                 if low <= partial_target:
                     self._take_partial(symbol, partial_target, kline["ts"])
-            if low <= pos.tp_price:
+            if tp_hit:
                 self._exit_position(symbol, pos.tp_price, "tp_hit", kline["ts"])
                 return
             if low < pos.peak_favorable or pos.peak_favorable == 0:
@@ -518,6 +559,7 @@ class BacktestEngine:
 
         self.trade_log.append({
             "ts": ts,
+            "datetime": dt.fromtimestamp(ts / 1000, tz=tz.utc).strftime("%Y-%m-%d %H:%M:%S"),
             "symbol": symbol,
             "side": pos.side.name,
             "entry": pos.entry_price,
@@ -526,6 +568,7 @@ class BacktestEngine:
             "pnl": raw_pnl,
             "pnl_R": 1.0,  # partial at 1R by definition
             "duration_ms": 0,
+            "duration_s": 0.0,
             "reason": "partial_tp",
         })
         self.equity_curve.append((ts, self.state.equity))
@@ -535,6 +578,7 @@ class BacktestEngine:
         if result:
             self.trade_log.append({
                 "ts": ts,
+                "datetime": dt.fromtimestamp(ts / 1000, tz=tz.utc).strftime("%Y-%m-%d %H:%M:%S"),
                 "symbol": symbol,
                 "side": result.side.name,
                 "entry": result.entry_price,
@@ -543,6 +587,7 @@ class BacktestEngine:
                 "pnl": result.pnl,
                 "pnl_R": result.pnl_R,
                 "duration_ms": result.duration_ms,
+                "duration_s": round(result.duration_ms / 1000, 2),
                 "reason": reason,
             })
 

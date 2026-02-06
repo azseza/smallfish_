@@ -185,18 +185,19 @@ class TestRuntimeState:
         assert "kill_switch" in summary
 
     def test_rolling_win_rate_not_enough_trades(self, config):
-        """With fewer than n trades, rolling_win_rate returns 1.0 (no restriction)."""
+        """With fewer than 10 trades, rolling_win_rate returns 1.0 (no restriction)."""
         state = RuntimeState(config)
-        # Add only 5 trades (less than default n=20)
-        for i in range(5):
+        # Add 9 losing trades (below minimum 10 needed for WR estimate)
+        for i in range(9):
             state.completed_trades.append(TradeResult(
                 symbol="BTCUSDT", side=Side.BUY,
-                entry_price=50000.0, exit_price=50010.0,
-                quantity=0.01, pnl=0.10, pnl_R=1.0,
+                entry_price=50000.0, exit_price=49990.0,
+                quantity=0.01, pnl=-0.10, pnl_R=-1.0,
                 entry_time=0, exit_time=1000,
                 duration_ms=1000, slippage_entry=0, slippage_exit=0,
-                signals_at_entry={}, exit_reason="tp_hit",
+                signals_at_entry={}, exit_reason="sl_hit",
             ))
+        # Even 9 consecutive losses should NOT trigger WR gate
         assert state.rolling_win_rate(20) == 1.0
 
     def test_rolling_win_rate_all_wins(self, config):

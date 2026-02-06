@@ -129,6 +129,14 @@ class ExchangeREST(ABC):
         """Get deposit address. Returns {address, chain, tag}."""
         ...
 
+    async def get_orderbook(self, symbol: str, depth: int = 50) -> dict:
+        """Fetch L2 orderbook snapshot via REST. Returns {b: [...], a: [...], seq: int}.
+
+        Used as a periodic fallback to heal WS delta drift.
+        Default returns empty dict (subclasses override).
+        """
+        return {}
+
     @abstractmethod
     async def close(self) -> None: ...
 
@@ -152,6 +160,10 @@ class ExchangeWS(ABC):
 
     @abstractmethod
     def latency_estimate_ms(self) -> int: ...
+
+    async def resubscribe_book(self, symbol: str) -> None:
+        """Resubscribe orderbook topic to force a fresh snapshot. Optional."""
+        pass
 
     @property
     @abstractmethod

@@ -165,6 +165,18 @@ class BybitWS(ExchangeWS):
         await ws.send(orjson.dumps(msg).decode())
         log.info("Private subscribed: %s", args)
 
+    async def resubscribe_book(self, symbol: str) -> None:
+        """Unsubscribe + re-subscribe orderbook topic to force a fresh snapshot."""
+        if not self._pub_ws or not self._pub_ws.open:
+            return
+        topic = f"orderbook.{self.book_depth}.{symbol}"
+        unsub = {"op": "unsubscribe", "args": [topic]}
+        await self._pub_ws.send(orjson.dumps(unsub).decode())
+        await asyncio.sleep(0.1)
+        sub = {"op": "subscribe", "args": [topic]}
+        await self._pub_ws.send(orjson.dumps(sub).decode())
+        log.info("Resubscribed orderbook for %s to force snapshot resync", symbol)
+
     # --- Message Loop ---
 
     async def _listen(self, ws, is_private: bool) -> None:

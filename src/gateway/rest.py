@@ -344,6 +344,24 @@ class BybitREST(ExchangeREST):
         unique.sort(key=lambda x: x["ts"])
         return unique
 
+    async def get_orderbook(self, symbol: str, depth: int = 50) -> dict:
+        """Fetch L2 orderbook snapshot via REST (public, no auth)."""
+        session = await self._get_session()
+        url = f"{self.base_url}/v5/market/orderbook"
+        params = {"category": "linear", "symbol": symbol, "limit": str(depth)}
+        try:
+            async with session.get(url, params=params) as resp:
+                data = await resp.json(content_type=None)
+                result = data.get("result", {})
+                return {
+                    "b": result.get("b", []),
+                    "a": result.get("a", []),
+                    "seq": int(result.get("seq", 0)),
+                }
+        except Exception as e:
+            log.warning("REST orderbook fetch failed for %s: %s", symbol, e)
+            return {}
+
     async def cleanup_bracket(self, symbol: str, order_id: str) -> None:
         """No-op for Bybit — native TP/SL handles cleanup automatically."""
         pass

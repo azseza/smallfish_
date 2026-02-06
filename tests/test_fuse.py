@@ -120,15 +120,15 @@ class TestCountAgreement:
             "prt_long": 0.5, "prt_short": 0.0,
             "umom_long": 0.6, "umom_short": 0.0,
             "ltb_long": 0.3, "ltb_short": 0.0,
-            "sweep_up": 0.2, "sweep_down": 0.0,
-            "ice_long": 0.1, "ice_short": 0.0,
+            "sweep_up": 0.3, "sweep_down": 0.0,
+            "ice_long": 0.25, "ice_short": 0.0,
             "vwap_long": 0.4, "vwap_short": 0.0,
             "regime_long": 0.3, "regime_short": 0.0,
             "cvd_long": 0.4, "cvd_short": 0.0,
             "tps_long": 0.3, "tps_short": 0.0,
-            "liq_long": 0.2, "liq_short": 0.0,
+            "liq_long": 0.25, "liq_short": 0.0,
             "mvr_long": 0.3, "mvr_short": 0.0,
-            "absorb_long": 0.1, "absorb_short": 0.0,
+            "absorb_long": 0.25, "absorb_short": 0.0,
         }
         assert count_agreement(scores, 1) == 13
 
@@ -151,8 +151,8 @@ class TestCountAgreement:
 
     def test_below_threshold_not_counted(self):
         scores = {k: 0.0 for k in ALL_SCORE_KEYS}
-        scores["obi_long"] = 0.04  # below 0.05 threshold
-        scores["prt_long"] = 0.06  # above threshold
+        scores["obi_long"] = 0.08  # below 0.10 threshold
+        scores["prt_long"] = 0.15  # above threshold
         assert count_agreement(scores, 1) == 1
 
 

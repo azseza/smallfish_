@@ -129,8 +129,12 @@ class OrderRouter:
             order_type=OrderType.MARKET,
             reduce_only=True,
         )
-        log.info("Market close: %s %s qty=%.6f -> %s", side.name, symbol, qty, result.order_id)
-        return result.order_id or None
+        if result.success and result.order_id:
+            log.info("Market close: %s %s qty=%.6f -> %s", side.name, symbol, qty, result.order_id)
+            return result.order_id
+        log.error("Market close FAILED: %s %s qty=%.6f err=%s",
+                  side.name, symbol, qty, result.error_msg)
+        return None
 
     async def place_limit(
         self,

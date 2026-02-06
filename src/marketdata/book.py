@@ -18,7 +18,11 @@ class OrderBook:
         "_prev_bid_total", "_prev_ask_total",
         "_prev_mid", "_mid_history",
         "_cancel_tracker",
+        "_warmup_count", "needs_snapshot",
     )
+
+    # Number of valid deltas required after a reset before is_fresh() returns True
+    WARMUP_DELTAS = 3
 
     def __init__(self, symbol: str = "", depth: int = 50, tick_size: float = 0.1):
         self.symbol = symbol
@@ -43,6 +47,11 @@ class OrderBook:
         # Cancel tracking: record (timestamp, side, price, old_size)
         self._cancel_tracker: RingBuffer[Tuple[int, str, float, float]] = RingBuffer(500)
 
+        # Warmup: require N valid deltas after snapshot before trading
+        self._warmup_count: int = 0
+        # Flag: set when book needs a fresh snapshot (crossed/seq gap)
+        self.needs_snapshot: bool = False
+
     # --- Snapshot & Delta ---
 
     def on_snapshot(self, bids: list, asks: list, seq: int = 0) -> None:
@@ -64,10 +73,42 @@ class OrderBook:
         self.last_update_seq = seq
         self.last_update_ts = time_now_ms()
         self._prev_mid = self.mid_price()
+        if self.needs_snapshot:
+            # Recovery snapshot after reset — require warmup deltas before trading
+            self._warmup_count = 0
+        else:
+            # Initial snapshot — ready to trade immediately
+            self._warmup_count = self.WARMUP_DELTAS
+        self.needs_snapshot = False
+
+    def reset(self) -> None:
+        """Clear all book data, forcing re-sync from next snapshot."""
+        self._bid_map.clear()
+        self._ask_map.clear()
+        self.bids.clear()
+        self.asks.clear()
+        self.last_update_ts = 0
+        self.last_update_seq = 0
+        self._warmup_count = 0
+        self.needs_snapshot = True
+        log.warning("Book reset for %s — awaiting fresh snapshot", self.symbol)
 
     def on_delta(self, bids: list, asks: list, seq: int = 0) -> None:
         """Process an incremental book delta."""
+        # If book was reset and hasn't received a snapshot yet, discard deltas
+        if self.needs_snapshot and not self._bid_map and not self._ask_map:
+            return
+
         now = time_now_ms()
+
+        # Sequence gap detection: if seq jumps, book is out of sync
+        if seq > 0 and self.last_update_seq > 0:
+            expected = self.last_update_seq + 1
+            if seq > expected:
+                log.warning("Seq gap on %s: expected %d, got %d (missed %d deltas) — resetting",
+                            self.symbol, expected, seq, seq - expected)
+                self.reset()
+                return
 
         # Track cancellations before applying delta
         for p, s in bids:
@@ -93,6 +134,18 @@ class OrderBook:
         self._rebuild_sorted()
         self.last_update_seq = seq
         self.last_update_ts = now
+
+        # Detect crossed book (bid >= ask) — indicates lost deltas / corruption
+        if self.bids and self.asks and self.bids[0][0] >= self.asks[0][0]:
+            log.warning("Crossed book detected on %s: bid=%.4f >= ask=%.4f — resetting",
+                        self.symbol, self.bids[0][0], self.asks[0][0])
+            self.reset()
+            return
+
+        # Valid delta — increment warmup counter
+        if self._warmup_count < self.WARMUP_DELTAS:
+            self._warmup_count += 1
+
         mid = self.mid_price()
         self._mid_history.append((now, mid))
         self._prev_mid = mid
@@ -133,7 +186,15 @@ class OrderBook:
         if self.last_update_ts == 0:
             return False
         age = time_now_ms() - self.last_update_ts
-        return age < max_staleness_ms
+        if age >= max_staleness_ms:
+            return False
+        # Crossed book = corrupted data — treat as stale
+        if self.bids and self.asks and self.bids[0][0] >= self.asks[0][0]:
+            return False
+        # Require N valid deltas after snapshot before considering book tradeable
+        if self._warmup_count < self.WARMUP_DELTAS:
+            return False
+        return True
 
     # --- Analytics ---
 

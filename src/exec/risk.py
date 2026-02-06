@@ -143,8 +143,11 @@ def can_trade(state: RuntimeState, book: OrderBook, symbol: str) -> tuple[bool, 
     if not book.is_fresh():
         return False, "stale_book"
 
-    if book.spread_ticks() > config.get("max_spread", 2):
-        return False, f"spread_too_wide: {book.spread_ticks():.1f}"
+    spread = book.spread_ticks()
+    if spread <= 0:
+        return False, f"crossed_book: {spread:.1f}"
+    if spread > config.get("max_spread", 2):
+        return False, f"spread_too_wide: {spread:.1f}"
 
     if state.latency_ms > config.get("max_latency_ms", 80):
         return False, f"high_latency: {state.latency_ms}ms"

@@ -269,12 +269,12 @@ class RuntimeState:
     def rolling_win_rate(self, n: int = 20) -> float:
         """Return win rate over the last *n* completed trades.
 
-        Returns 1.0 when fewer than *n* trades have been recorded
-        (not enough data to judge).
+        Requires at least 10 trades for a meaningful estimate.
+        With fewer trades, returns 1.0 (don't restrict on thin data).
         """
         trades = self.completed_trades.last(n)
-        if len(trades) < n:
-            return 1.0  # not enough data — don't restrict
+        if len(trades) < 10:
+            return 1.0  # not enough data for reliable WR estimate
         wins = sum(1 for t in trades if t.pnl > 0)
         return wins / len(trades)
 

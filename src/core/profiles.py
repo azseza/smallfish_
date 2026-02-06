@@ -62,8 +62,8 @@ PROFILES: Dict[str, Dict[str, Any]] = {
         "risk_pct": 0.025,       # 2.5% risk per trade
         "max_risk_usd": 40.0,
         "equity_cap_mult": 4,    # compound up to 4x
-        "sl_range_mult": 0.35,   # tighter SL (was 0.50) — smaller losses
-        "tp_range_mult": 1.40,   # TP at 4:1 R:R
+        "sl_range_mult": 0.50,   # proven SL distance — 0.30-0.35 gets whipsawed on 1m candles
+        "tp_range_mult": 1.60,   # R:R = 3.2:1 — wider TP lets winners run
         "trail_pct": 0.30,       # trail at 30% of range
         "trail_activation_R": 0.3,  # start trailing after 0.3R — balanced
         "cooldown_ms": 30_000,   # 30s cooldown
