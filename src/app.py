@@ -102,6 +102,16 @@ async def main() -> None:
         api_secret = os.environ.get("BINANCE_API_SECRET", "")
         testnet = os.environ.get("BINANCE_TESTNET", "false").lower() == "true"
         env_label = "BINANCE_API_KEY / BINANCE_API_SECRET"
+    elif exchange == "mexc":
+        api_key = os.environ.get("MEXC_API_KEY", "")
+        api_secret = os.environ.get("MEXC_API_SECRET", "")
+        testnet = False  # MEXC has no futures testnet
+        env_label = "MEXC_API_KEY / MEXC_API_SECRET"
+    elif exchange == "dydx":
+        api_key = os.environ.get("DYDX_ADDRESS", "")
+        api_secret = os.environ.get("DYDX_MNEMONIC", "")
+        testnet = os.environ.get("DYDX_TESTNET", "false").lower() == "true"
+        env_label = "DYDX_ADDRESS / DYDX_MNEMONIC"
     else:
         api_key = os.environ.get("BYBIT_API_KEY", "")
         api_secret = os.environ.get("BYBIT_API_SECRET", "")

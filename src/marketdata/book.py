@@ -150,9 +150,32 @@ class OrderBook:
         self._mid_history.append((now, mid))
         self._prev_mid = mid
 
+    # Maximum ratio of map size to depth before pruning kicks in.
+    # E.g. depth=50, ratio=4 → prune when map exceeds 200 entries.
+    _PRUNE_RATIO = 4
+
     def _rebuild_sorted(self) -> None:
         self.bids = sorted(self._bid_map.items(), key=lambda x: -x[0])[:self.depth]
         self.asks = sorted(self._ask_map.items(), key=lambda x: x[0])[:self.depth]
+        self._prune_maps()
+
+    def _prune_maps(self) -> None:
+        """Remove stale price levels far from BBO to prevent unbounded map growth.
+
+        Over long sessions, price walking leaves thousands of dead levels in the
+        maps. This caps memory to ~4x depth entries per side.
+        """
+        limit = self.depth * self._PRUNE_RATIO
+        if len(self._bid_map) > limit and self.bids:
+            threshold = self.bids[-1][0]  # lowest visible bid
+            stale = [p for p in self._bid_map if p < threshold]
+            for p in stale:
+                del self._bid_map[p]
+        if len(self._ask_map) > limit and self.asks:
+            threshold = self.asks[-1][0]  # highest visible ask
+            stale = [p for p in self._ask_map if p > threshold]
+            for p in stale:
+                del self._ask_map[p]
 
     # --- Core Accessors ---
 

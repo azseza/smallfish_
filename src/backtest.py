@@ -228,6 +228,12 @@ class BacktestEngine:
         # Track initial stop price per symbol to detect trailing
         self._initial_stop: Dict[str, float] = {}
 
+        # Fee modeling (opt-in via --fees flag or config)
+        self._maker_fee = config.get("backtest_maker_fee", 0.0002)   # 0.02% Bybit standard
+        self._taker_fee = config.get("backtest_taker_fee", 0.00055)  # 0.055% Bybit standard
+        self._fees_enabled = config.get("backtest_fees", False)
+        self._total_fees = 0.0
+
 
     def init_symbol(self, symbol: str):
         tick_size = self.config.get("tick_sizes", {}).get(symbol, 0.01)
@@ -355,6 +361,8 @@ class BacktestEngine:
             tp_price = entry_price - tp_distance
 
         # Position sizing with sqrt-compounding (dampens runaway growth)
+        if self.state.equity <= 0:
+            return
         use_equity = self._fixed_equity * min(
             math.sqrt(self.state.equity / self._fixed_equity),
             self._equity_cap_mult,
@@ -576,6 +584,15 @@ class BacktestEngine:
     def _exit_position(self, symbol: str, exit_price: float, reason: str, ts: int) -> None:
         result = self.state.on_exit(symbol, exit_price, reason)
         if result:
+            fee = 0.0
+            if self._fees_enabled:
+                notional_entry = result.entry_price * result.quantity
+                notional_exit = exit_price * result.quantity
+                exit_fee = self._maker_fee if reason == "tp_hit" else self._taker_fee
+                fee = notional_entry * self._maker_fee + notional_exit * exit_fee
+                self.state.equity -= fee
+                self._total_fees += fee
+
             self.trade_log.append({
                 "ts": ts,
                 "datetime": dt.fromtimestamp(ts / 1000, tz=tz.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -589,6 +606,7 @@ class BacktestEngine:
                 "duration_ms": result.duration_ms,
                 "duration_s": round(result.duration_ms / 1000, 2),
                 "reason": reason,
+                "fee": round(fee, 6),
             })
 
         self.equity_curve.append((ts, self.state.equity))
@@ -666,6 +684,8 @@ class BacktestEngine:
             "sharpe_ratio": round(sharpe, 3),
             "max_drawdown_pct": round(max_dd * 100, 2),
             "trades_per_day": round(n / max(len(set(t["ts"] // 86400000 for t in trades)), 1), 1),
+            "total_fees": round(self._total_fees, 4),
+            "fees_enabled": self._fees_enabled,
             "exit_reasons": reasons,
         }
 
@@ -674,11 +694,14 @@ class BacktestEngine:
 
 async def run_backtest(symbols: List[str], days: int = 30, equity: float = 50.0,
                        profile: str = "conservative", auto_symbols: int = 0,
-                       show_chart: bool = False, exchange: str = "bybit"):
+                       show_chart: bool = False, exchange: str = "bybit",
+                       fee_override: dict = None, interval: str = "1"):
     # Load config
     config_path = os.path.join(os.path.dirname(__file__), "..", "config", "default.yaml")
     with open(config_path) as f:
         config = yaml.safe_load(f)
+    if fee_override:
+        config.update(fee_override)
 
     exchange = config.get("exchange", exchange)
 
@@ -717,8 +740,8 @@ async def run_backtest(symbols: List[str], days: int = 30, equity: float = 50.0,
 
     sym_str = "+".join(symbols)
     log.info("=" * 60)
-    log.info("  BACKTEST: %s | %d days | $%.2f | profile=%s",
-             sym_str, days, equity, profile)
+    log.info("  BACKTEST: %s | %d days | $%.2f | profile=%s | interval=%sm",
+             sym_str, days, equity, profile, interval)
     log.info("=" * 60)
 
     # Download data for all symbols
@@ -727,10 +750,11 @@ async def run_backtest(symbols: List[str], days: int = 30, equity: float = 50.0,
 
     all_klines: Dict[str, List[dict]] = {}
     for sym in symbols:
-        log.info("Downloading %d days of 1-minute klines for %s...", days, sym)
-        klines = await fetch_klines(sym, "1", start_ms, end_ms, exchange=exchange)
+        log.info("Downloading %d days of %sm klines for %s...", days, interval, sym)
+        klines = await fetch_klines(sym, interval, start_ms, end_ms, exchange=exchange)
+        candles_per_day = 1440 / int(interval)
         log.info("Downloaded %d candles for %s (%.1f days)", len(klines), sym,
-                 len(klines) / 1440 if klines else 0)
+                 len(klines) / candles_per_day if klines else 0)
         if len(klines) >= 100:
             all_klines[sym] = klines
         else:
@@ -781,8 +805,10 @@ async def run_backtest(symbols: List[str], days: int = 30, equity: float = 50.0,
         if day != last_day:
             engine.equity_curve.append((ts, engine.state.equity))
             last_day = day
-            if engine.state.kill_switch:
-                engine.state.reset_daily()
+            # Always reset daily counters at day boundary
+            # (previously only reset when kill_switch was True,
+            #  causing daily_loss_R to accumulate across days)
+            engine.state.reset_daily()
 
     # Close any open positions
     for sym, klines in all_klines.items():
@@ -793,6 +819,7 @@ async def run_backtest(symbols: List[str], days: int = 30, equity: float = 50.0,
     clear_sim_time()
 
     report = engine.report()
+    report["interval"] = interval
     print_report(report, symbols, days, equity, profile)
 
     # Terminal charts if --chart flag
@@ -813,11 +840,14 @@ def print_report(report: dict, symbols: list, days: int, equity: float, profile:
     print(f"  BACKTEST RESULTS — [{profile.upper()}]")
     print("=" * 60)
     print(f"  Symbols:             {sym_str}")
-    print(f"  Period:              {days} days")
+    interval = report.get("interval", "1")
+    print(f"  Period:              {days} days | {interval}m candles")
     print(f"  Profile:             {profile}")
     print(f"  Initial Equity:      ${report.get('initial_equity', 0):.2f}")
     print(f"  Final Equity:        ${report.get('final_equity', 0):.2f}")
     print(f"  Total P&L:           ${report.get('total_pnl', 0):.2f}")
+    if report.get("fees_enabled"):
+        print(f"  Total Fees:          ${report.get('total_fees', 0):.2f}")
     print(f"  Total Return:        {report.get('total_return_pct', 0):.2f}%")
     print("-" * 60)
     print(f"  Total Trades:        {report.get('total_trades', 0)}")
@@ -858,13 +888,29 @@ def print_report(report: dict, symbols: list, days: int, equity: float, profile:
 
 
 async def run_sweep(symbols: List[str], days: int = 30, equity: float = 50.0,
-                    exchange: str = "bybit"):
+                    exchange: str = "bybit", fee_override: dict = None,
+                    interval: str = "1"):
     """Run all profiles and compare results."""
     config_path = os.path.join(os.path.dirname(__file__), "..", "config", "default.yaml")
     with open(config_path) as f:
         base_config = yaml.safe_load(f)
+    if fee_override:
+        base_config.update(fee_override)
 
     exchange = base_config.get("exchange", exchange)
+
+    # Fetch instrument specs (tick_size, min_qty, qty_step) from exchange
+    rest = create_rest(exchange, api_key="", api_secret="")
+    try:
+        specs_list = await rest.get_instruments()
+    finally:
+        await rest.close()
+    specs = {s.symbol: s for s in specs_list}
+    for sym in symbols:
+        if sym in specs:
+            base_config.setdefault("tick_sizes", {})[sym] = specs[sym].tick_size
+            base_config.setdefault("min_qty", {})[sym] = specs[sym].min_qty
+            base_config.setdefault("qty_step", {})[sym] = specs[sym].qty_step
 
     # Download data once
     end_ms = int(time.time() * 1000)
@@ -872,8 +918,8 @@ async def run_sweep(symbols: List[str], days: int = 30, equity: float = 50.0,
 
     all_klines: Dict[str, List[dict]] = {}
     for sym in symbols:
-        log.info("Downloading %d days of 1-minute klines for %s...", days, sym)
-        klines = await fetch_klines(sym, "1", start_ms, end_ms, exchange=exchange)
+        log.info("Downloading %d days of %sm klines for %s...", days, interval, sym)
+        klines = await fetch_klines(sym, interval, start_ms, end_ms, exchange=exchange)
         log.info("Downloaded %d candles for %s", len(klines), sym)
         if len(klines) >= 100:
             all_klines[sym] = klines
@@ -920,8 +966,7 @@ async def run_sweep(symbols: List[str], days: int = 30, equity: float = 50.0,
             if day != last_day:
                 engine.equity_curve.append((ts, engine.state.equity))
                 last_day = day
-                if engine.state.kill_switch:
-                    engine.state.reset_daily()
+                engine.state.reset_daily()
 
         for sym, klines in all_klines.items():
             if engine.state.has_position(sym):
@@ -942,14 +987,20 @@ async def run_sweep(symbols: List[str], days: int = 30, equity: float = 50.0,
     print("  PROFILE COMPARISON SWEEP")
     print("=" * 80)
     sym_str = "+".join(symbols)
-    print(f"  Symbols: {sym_str} | Period: {days} days | Start: ${equity:.2f}")
+    fees_on = fee_override and fee_override.get("backtest_fees", False)
+    maker = fee_override.get("backtest_maker_fee", 0.0002) if fee_override else 0.0002
+    taker = fee_override.get("backtest_taker_fee", 0.00055) if fee_override else 0.00055
+    fees_str = f" | fees: {maker*100:.3f}%/{taker*100:.3f}%" if fees_on else " | NO FEES"
+    print(f"  Symbols: {sym_str} | Period: {days} days | {interval}m candles | Start: ${equity:.2f}{fees_str}")
     print("-" * 80)
+    hdr_fees = f"{'Fees':>8}" if fees_on else ""
     print(f"  {'Profile':<14} {'Return':>8} {'Final $':>9} {'Trades':>7} {'WR':>6} {'PF':>6} "
-          f"{'Sharpe':>7} {'MaxDD':>7} {'Avg R':>7}")
+          f"{'Sharpe':>7} {'MaxDD':>7} {'Avg R':>7} {hdr_fees}")
     print("-" * 80)
 
     for name in ["conservative", "balanced", "aggressive", "ultra"]:
         r = results[name]
+        fee_col = f" ${r.get('total_fees',0):>6.2f}" if fees_on else ""
         print(f"  {name:<14} {r.get('total_return_pct',0):>+7.1f}% "
               f"${r.get('final_equity',0):>7.2f} "
               f"{r.get('total_trades',0):>7d} "
@@ -957,7 +1008,7 @@ async def run_sweep(symbols: List[str], days: int = 30, equity: float = 50.0,
               f"{r.get('profit_factor',0):>5.2f} "
               f"{r.get('sharpe_ratio',0):>7.3f} "
               f"{r.get('max_drawdown_pct',0):>6.1f}% "
-              f"{r.get('avg_R',0):>6.3f}R")
+              f"{r.get('avg_R',0):>6.3f}R{fee_col}")
 
     print("=" * 80)
 
@@ -1070,8 +1121,7 @@ async def backfill_trades(symbols: list[str], config: dict, days: int = 7,
         if day != last_day:
             engine.equity_curve.append((ts, engine.state.equity))
             last_day = day
-            if engine.state.kill_switch:
-                engine.state.reset_daily()
+            engine.state.reset_daily()
 
     # Close any open positions
     for sym, klines in all_klines.items():
@@ -1113,8 +1163,17 @@ if __name__ == "__main__":
                         help="Run all profiles and compare")
     parser.add_argument("--chart", action="store_true",
                         help="Show terminal bar charts (trade PnL, equity curve, signal weights)")
-    parser.add_argument("--exchange", default="bybit", choices=["bybit", "binance"],
+    parser.add_argument("--exchange", default="bybit",
+                        choices=["bybit", "binance", "mexc", "dydx"],
                         help="Exchange to use for data download")
+    parser.add_argument("--fees", action="store_true",
+                        help="Enable realistic fee modeling (maker 0.02%%, taker 0.055%%)")
+    parser.add_argument("--interval", default="1", choices=["1", "3", "5", "15", "30", "60"],
+                        help="Candle interval in minutes (default: 1)")
+    parser.add_argument("--maker-fee", type=float, default=None, metavar="PCT",
+                        help="Override maker fee rate (e.g. 0.0002 for 0.02%%)")
+    parser.add_argument("--taker-fee", type=float, default=None, metavar="PCT",
+                        help="Override taker fee rate (e.g. 0.00055 for 0.055%%)")
     args = parser.parse_args()
 
     if args.symbols:
@@ -1124,9 +1183,22 @@ if __name__ == "__main__":
     else:
         symbols = [args.symbol]
 
+    # Pass fees flag via environment or config override
+    fee_override = {}
+    if args.fees:
+        fee_override["backtest_fees"] = True
+    if args.maker_fee is not None:
+        fee_override["backtest_maker_fee"] = args.maker_fee
+        fee_override["backtest_fees"] = True
+    if args.taker_fee is not None:
+        fee_override["backtest_taker_fee"] = args.taker_fee
+        fee_override["backtest_fees"] = True
+
     if args.sweep:
-        asyncio.run(run_sweep(symbols, args.days, args.equity, exchange=args.exchange))
+        asyncio.run(run_sweep(symbols, args.days, args.equity, exchange=args.exchange,
+                              fee_override=fee_override, interval=args.interval))
     else:
         asyncio.run(run_backtest(symbols, args.days, args.equity, args.mode,
                                   auto_symbols=args.auto, show_chart=args.chart,
-                                  exchange=args.exchange))
+                                  exchange=args.exchange, fee_override=fee_override,
+                                  interval=args.interval))

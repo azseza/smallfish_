@@ -1,6 +1,7 @@
 from __future__ import annotations
 import logging
 import time
+from collections import deque
 from typing import Optional, Dict, List
 
 from core.types import (
@@ -8,6 +9,11 @@ from core.types import (
 )
 from core.ringbuffer import RingBuffer
 from core.utils import time_now_ms, clamp
+
+# Caps for long-running memory safety (RPi-friendly)
+_MAX_SYMBOLS = 50          # max tracked symbols in per-symbol dicts
+_MAX_WITHDRAWAL_HISTORY = 100
+_MAX_GRID_HARVEST_IDS = 200
 
 log = logging.getLogger(__name__)
 
@@ -82,7 +88,7 @@ class RuntimeState:
 
         # --- Cash out state ---
         self.pending_cashout: Optional[dict] = None  # preview state for confirmation
-        self.withdrawal_history: list[dict] = []  # [{ts, amount, tx_id, address}]
+        self.withdrawal_history: deque[dict] = deque(maxlen=_MAX_WITHDRAWAL_HISTORY)
 
     # --- Position helpers ---
 
@@ -264,7 +270,41 @@ class RuntimeState:
         self.loss_count = 0
         self.kill_switch = False
         self.kill_reason = ""
+        self._prune_stale_state()
         log.info("Daily state reset. Equity=%.2f", self.equity)
+
+    def _prune_stale_state(self) -> None:
+        """Remove stale per-symbol state for symbols no longer active.
+
+        Prevents unbounded growth of per-symbol dicts during long sessions
+        (important for memory-constrained devices like Raspberry Pi).
+        """
+        active = set(self.positions.keys())
+        now = time_now_ms()
+        stale_cutoff = now - 3600_000  # 1 hour
+
+        # Prune scores for symbols not in position and not recently scored
+        if len(self.scores_by_symbol) > _MAX_SYMBOLS:
+            stale_syms = [
+                sym for sym, data in self.scores_by_symbol.items()
+                if sym not in active and data.get("ts", 0) < stale_cutoff
+            ]
+            for sym in stale_syms:
+                del self.scores_by_symbol[sym]
+
+        # Prune last_entry_ts for symbols not in position
+        if len(self.last_entry_ts) > _MAX_SYMBOLS:
+            stale_syms = [
+                sym for sym, ts in self.last_entry_ts.items()
+                if sym not in active and ts < stale_cutoff
+            ]
+            for sym in stale_syms:
+                del self.last_entry_ts[sym]
+
+        # Prune orphaned grid harvest IDs (orders older than 1h)
+        if len(self.grid_harvest_ids) > _MAX_GRID_HARVEST_IDS:
+            self.grid_harvest_ids.clear()
+            log.warning("Cleared oversized grid_harvest_ids")
 
     def rolling_win_rate(self, n: int = 20) -> float:
         """Return win rate over the last *n* completed trades.

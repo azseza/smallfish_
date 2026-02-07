@@ -132,12 +132,12 @@ class TerminalDashboard:
         symbols = config.get("symbols", [])
         self.chart_symbol: str = symbols[0] if symbols else ""
 
-        # Order markers on candle chart
-        self._buy_markers: list[Tuple[int, float]] = []   # (candle_idx, price)
-        self._sell_markers: list[Tuple[int, float]] = []
+        # Order markers on candle chart (bounded to prevent memory growth)
+        self._buy_markers: deque[Tuple[int, float]] = deque(maxlen=100)
+        self._sell_markers: deque[Tuple[int, float]] = deque(maxlen=100)
 
-        # Equity history for equity curve
-        self._equity_history: list[float] = []
+        # Equity history for equity curve (bounded)
+        self._equity_history: deque[float] = deque(maxlen=_MAX_EQUITY_POINTS)
 
         # System info cache (refreshed every 5s to avoid overhead)
         self._sys_info: dict = {}
@@ -264,12 +264,8 @@ class TerminalDashboard:
         idx = len(self._candles)
         if side.upper() == "BUY":
             self._buy_markers.append((idx, price))
-            if len(self._buy_markers) > 100:
-                self._buy_markers = self._buy_markers[-50:]
         else:
             self._sell_markers.append((idx, price))
-            if len(self._sell_markers) > 100:
-                self._sell_markers = self._sell_markers[-50:]
 
     # ── Lifecycle ─────────────────────────────────────────────────
 
@@ -318,8 +314,6 @@ class TerminalDashboard:
 
     def _record_snapshot(self) -> None:
         self._equity_history.append(self.state.equity)
-        if len(self._equity_history) > _MAX_EQUITY_POINTS:
-            self._equity_history = self._equity_history[-_MAX_EQUITY_POINTS:]
 
     # ── Layout construction ───────────────────────────────────────
 

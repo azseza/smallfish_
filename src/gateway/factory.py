@@ -5,6 +5,8 @@ from typing import List, Optional, Callable, Awaitable
 from gateway.base import ExchangeREST, ExchangeWS
 from core.types import WsEvent
 
+_SUPPORTED = ("bybit", "binance", "mexc", "dydx")
+
 
 def create_rest(
     exchange: str,
@@ -15,9 +17,9 @@ def create_rest(
     """Create an exchange REST client.
 
     Args:
-        exchange: "bybit" or "binance"
-        api_key: API key
-        api_secret: API secret
+        exchange: "bybit", "binance", "mexc", or "dydx"
+        api_key: API key (or dYdX address)
+        api_secret: API secret (or dYdX mnemonic)
         testnet: Use testnet endpoints
     """
     exchange = exchange.lower()
@@ -27,8 +29,14 @@ def create_rest(
     elif exchange == "binance":
         from gateway.binance_rest import BinanceREST
         return BinanceREST(api_key, api_secret, testnet=testnet)
+    elif exchange == "mexc":
+        from gateway.mexc_rest import MexcREST
+        return MexcREST(api_key, api_secret, testnet=testnet)
+    elif exchange == "dydx":
+        from gateway.dydx_rest import DydxREST
+        return DydxREST(api_key, api_secret, testnet=testnet)
     else:
-        raise ValueError(f"Unsupported exchange: {exchange!r}. Use 'bybit' or 'binance'.")
+        raise ValueError(f"Unsupported exchange: {exchange!r}. Use one of {_SUPPORTED}.")
 
 
 def create_ws(
@@ -43,7 +51,7 @@ def create_ws(
     """Create an exchange WebSocket client.
 
     Args:
-        exchange: "bybit" or "binance"
+        exchange: "bybit", "binance", "mexc", or "dydx"
         symbols: List of symbols to subscribe
         config: Application config dict
         api_key: API key (for private streams)
@@ -58,5 +66,11 @@ def create_ws(
     elif exchange == "binance":
         from gateway.binance_ws import BinanceWS
         return BinanceWS(symbols, config, api_key, api_secret, testnet, on_event)
+    elif exchange == "mexc":
+        from gateway.mexc_ws import MexcWS
+        return MexcWS(symbols, config, api_key, api_secret, testnet, on_event)
+    elif exchange == "dydx":
+        from gateway.dydx_ws import DydxWS
+        return DydxWS(symbols, config, api_key, api_secret, testnet, on_event)
     else:
-        raise ValueError(f"Unsupported exchange: {exchange!r}. Use 'bybit' or 'binance'.")
+        raise ValueError(f"Unsupported exchange: {exchange!r}. Use one of {_SUPPORTED}.")

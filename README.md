@@ -46,23 +46,28 @@ Exchange WebSocket (L2 book + trades)     ← ExchangeWS ABC (Bybit or Binance)
 
 ### Multi-Exchange Gateway
 
-Smallfish uses an exchange-agnostic gateway layer. Both Bybit and Binance USDT-M perpetual
-futures are supported through abstract interfaces:
+Smallfish uses an exchange-agnostic gateway layer. Bybit, Binance, MEXC, and dYdX v4
+perpetual futures are supported through abstract interfaces:
 
 ```
 gateway/
 ├── base.py           # ExchangeREST + ExchangeWS ABCs, normalized types
 ├── factory.py        # create_rest() / create_ws() — dispatch by exchange name
+├── symbol_map.py     # Symbol format conversion (BTCUSDT ↔ BTC_USDT / BTC-USD)
 ├── rest.py           # Bybit REST adapter
 ├── bybit_ws.py       # Bybit WebSocket adapter
 ├── binance_rest.py   # Binance REST adapter
 ├── binance_ws.py     # Binance WebSocket adapter
+├── mexc_rest.py      # MEXC Futures REST adapter
+├── mexc_ws.py        # MEXC Futures WebSocket adapter
+├── dydx_rest.py      # dYdX v4 Indexer REST + SDK adapter
+├── dydx_ws.py        # dYdX v4 Indexer WebSocket adapter
 └── persistence.py    # CSV logging
 ```
 
 Switch between exchanges with a single config line:
 ```yaml
-exchange: "bybit"   # or "binance"
+exchange: "bybit"   # or "binance", "mexc", "dydx"
 ```
 
 ## Signals (13 total)
@@ -161,21 +166,22 @@ Activate with `--dashboard` or set `dashboard.enabled: true` in config.
 
 ## Risk Profiles
 
-4 profiles tuned from 7-day parameter sweeps and backtest validation:
+4 profiles fee-optimized from 30-day parameter sweeps on 5m candles (ADA+DOGE+XRP+SUI):
 
 | Profile | Risk/Trade | SL | TP | Trail | R:R | Partial TP | Min Signals | C_enter |
 |---------|-----------|-----|-----|-------|-----|------------|-------------|---------|
-| **conservative** | 0.5% | 0.50x | 1.30x | 30% | 2.6:1 | No | 5/13 | 0.58 |
-| **balanced** | 1.5% | 0.50x | 1.60x | 25% | 3.2:1 | No | 4/13 | 0.55 |
-| **aggressive** | 2.5% | 0.50x | 1.60x | 22% | 3.2:1 | No | 3/13 | 0.55 |
-| **ultra** | 3.5% | 0.50x | 2.00x | 20% | 4.0:1 | No | 3/13 | 0.52 |
+| **conservative** | 0.5% | 0.80x | 2.00x | 30% | 2.5:1 | No | 5/13 | 0.58 |
+| **balanced** | 1.5% | 0.80x | 2.00x | 25% | 2.5:1 | No | 4/13 | 0.55 |
+| **aggressive** | 2.5% | 1.00x | 2.50x | 20% | 2.5:1 | No | 3/13 | 0.58 |
+| **ultra** | 3.5% | 1.00x | 2.50x | 20% | 2.5:1 | No | 3/13 | 0.52 |
 
 Key findings from parameter sweeps:
 - `partial_tp=False` always — partial TP cuts avg win in half, destroying the edge
 - `breakeven_R=disabled` always — early breakeven move chops winners via noise
-- `sl_range_mult=0.50` — 0.30 is too tight for 1m candles, gets whipsawed
-- `tp_range_mult >= 1.30` — wider TP lets winners run, improves avg_win/avg_loss ratio
-- `trail_pct=0.20-0.30` — tight trailing, never disabled
+- `sl_range_mult=0.80-1.00` — wider SL boosts WR from 50% to 70%, reduces whipsaw
+- `tp_range_mult=2.00-2.50` — wider TP lets winners run further
+- `trail_pct=0.20-0.25` — tighter trailing is the single biggest lever (3x return improvement)
+- `trail_activation_R=0.3` — start trailing early to lock profit
 
 ## Remote Control
 
@@ -289,7 +295,7 @@ Receive email notifications for critical events:
 
 ### Requirements
 - Python 3.10+
-- Bybit or Binance API key with trading permissions
+- API key for Bybit, Binance, MEXC, or dYdX v4 with trading permissions
 
 ### Installation
 
@@ -331,9 +337,32 @@ BINANCE_API_SECRET=your_api_secret_here
 BINANCE_TESTNET=true  # remove or set to false for live trading
 ```
 
-7. Set the exchange in `config/default.yaml`:
+#### MEXC (Recommended for lowest fees)
+
+1. Go to [mexc.com](https://www.mexc.com) → Profile → API Management
+2. Create a new API key — enable **Futures Trading** permission
+3. MEXC has **no futures testnet** — start with conservative profile and small equity
+4. Add to your `.env`:
+```bash
+MEXC_API_KEY=your_access_key_here
+MEXC_API_SECRET=your_secret_key_here
+```
+
+#### dYdX v4
+
+1. Create a dYdX v4 wallet at [dydx.trade](https://dydx.trade)
+2. For testnet: use [v4testnet.dydx.exchange](https://v4testnet.dydx.exchange)
+3. Install the optional SDK: `pip install dydx-v4-client` (or `poetry install -E dydx`)
+4. Add to your `.env`:
+```bash
+DYDX_ADDRESS=your_dydx_address_here
+DYDX_MNEMONIC="your wallet mnemonic phrase here"
+DYDX_TESTNET=true     # remove for mainnet
+```
+
+Set the exchange in `config/default.yaml`:
 ```yaml
-exchange: "binance"   # or "bybit"
+exchange: "mexc"   # or "bybit", "binance", "dydx"
 ```
 
 #### Raspberry Pi Deployment
@@ -471,10 +500,15 @@ src/
 ├── gateway/
 │   ├── base.py            # ExchangeREST + ExchangeWS ABCs + normalized types
 │   ├── factory.py         # Exchange factory: create_rest() / create_ws()
+│   ├── symbol_map.py      # Symbol format conversion (BTCUSDT ↔ BTC_USDT / BTC-USD)
 │   ├── rest.py            # Bybit REST adapter
 │   ├── bybit_ws.py        # Bybit WebSocket adapter
 │   ├── binance_rest.py    # Binance REST adapter
 │   ├── binance_ws.py      # Binance WebSocket adapter
+│   ├── mexc_rest.py       # MEXC Futures REST adapter
+│   ├── mexc_ws.py         # MEXC Futures WebSocket adapter
+│   ├── dydx_rest.py       # dYdX v4 Indexer REST + SDK adapter
+│   ├── dydx_ws.py         # dYdX v4 Indexer WebSocket adapter
 │   └── persistence.py     # CSV logging (decisions, orders, trades)
 ├── monitor/
 │   ├── metrics.py         # Performance analytics
@@ -484,6 +518,74 @@ src/
     ├── telegram_bot.py    # Telegram bot for remote control
     └── email_alert.py     # Email notifications for critical events
 ```
+
+## Golden Fish
+
+The golden path — fee-optimized commands for maximum revenue. Use MEXC (0% maker / 0.01% taker)
+with 5-minute candles on cheap volatile assets. This is the configuration that turns smallfish
+into a golden fish.
+
+### Backtest (validate before going live)
+
+```bash
+# Sweep all profiles on the 4 golden assets — no fees (raw signal edge)
+smallfish-backtest --symbols ADAUSDT DOGEUSDT XRPUSDT SUIUSDT --days 30 --sweep --interval 5 --equity 50
+
+# Sweep with MEXC fees (the only fee tier that works)
+smallfish-backtest --symbols ADAUSDT DOGEUSDT XRPUSDT SUIUSDT --days 30 --sweep --interval 5 --equity 50 --maker-fee 0.0 --taker-fee 0.0001
+
+# Single aggressive backtest on MEXC data
+smallfish-backtest --symbol ADAUSDT --days 30 --mode aggressive --interval 5 --equity 50 --exchange mexc
+
+# Quick 7-day validation
+smallfish-backtest --symbols ADAUSDT DOGEUSDT --days 7 --mode aggressive --interval 5 --equity 50 --maker-fee 0.0 --taker-fee 0.0001 --chart
+```
+
+### Live Trading (MEXC)
+
+```bash
+# Conservative first — no testnet on MEXC, so start safe
+smallfish --mode conservative --dashboard
+
+# Aggressive with dashboard + Telegram monitoring
+smallfish --mode aggressive --dashboard --telegram
+
+# Ultra mode — maximum compounding (high risk)
+smallfish --mode ultra --dashboard --telegram
+
+# Full stack: multigrid + dashboard + Telegram
+smallfish --mode aggressive --dashboard --multigrid --telegram
+```
+
+### Fee Viability Reference
+
+| Exchange | Maker | Taker | Verdict |
+|----------|-------|-------|---------|
+| **MEXC** | 0.000% | 0.010% | All profiles profitable |
+| Near-zero | 0.005% | 0.005% | All profiles profitable |
+| VIP1 | 0.010% | 0.035% | All profiles negative |
+| Standard | 0.020% | 0.055% | Devastating |
+| dYdX | 0.010% | 0.050% | All profiles negative |
+
+### Golden Rules
+
+1. **Only cheap volatile assets**: ADA, DOGE, XRP, SUI — never BTC/ETH (fee ratio too high)
+2. **Only 5m candles**: 1m is too noisy for fees, 30m kills signal quality
+3. **Only MEXC or near-zero fee exchanges**: anything above 0.01%/side kills the edge
+4. **Start conservative**: validate fills and slippage before scaling up
+5. **Respect the kill switch**: the market will always be there tomorrow
+
+### Expected Performance (MEXC fees, 30d, 5m, $50 start)
+
+| Profile | Return | Win Rate | Profit Factor | Trades |
+|---------|--------|----------|---------------|--------|
+| conservative | +97% | 65% | 1.59 | 1172 |
+| balanced | +621% | 66% | 1.46 | 2101 |
+| aggressive | +9361% | 71% | 1.74 | 5413 |
+| ultra | +14243% | 70% | 1.58 | 6578 |
+
+> These are backtest results. Live performance will be lower due to slippage, partial fills,
+> and latency. Expect 30-50% of backtest returns in live trading.
 
 ## License
 

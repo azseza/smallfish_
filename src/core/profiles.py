@@ -9,23 +9,25 @@ from __future__ import annotations
 from typing import Dict, Any
 
 PROFILES: Dict[str, Dict[str, Any]] = {
-    # ── Profiles tuned from 7D backtest + corrected param sweep ──────
+    # ── Fee-optimized profiles (30d 5m sweep on ADA+DOGE+XRP+SUI) ────
     #
-    # Validated findings (BacktestEngine-confirmed):
+    # Key findings from parameter optimization at MEXC fees (0%/0.01%):
     #   - partial_tp=False     (always — cuts avg win in half, kills edge)
     #   - breakeven_R=999      (disabled — early BE chops winners via noise)
-    #   - sl_range_mult=0.50   (0.30 is too tight for 1m candles, gets whipsawed)
-    #   - tp_range_mult≥1.30   (wider TP lets winners run, improves avg_win/avg_loss)
-    #   - trail_pct=0.20-0.30  (tight trailing, never disabled)
+    #   - sl_range_mult=0.80-1.00  (wider SL boosts WR from 50%→65-70%, reduces whipsaw)
+    #   - tp_range_mult=2.00-2.50  (wider TP lets winners run, best at 2.50+)
+    #   - trail_pct=0.20       (tighter trailing = biggest single impact: +3460% vs +1209%)
+    #   - trail_activation_R=0.3  (start trailing early to lock profit)
+    #   - Wider SL shrinks fee-to-risk ratio (stop distance ↑, fee/risk ↓)
 
     "conservative": {
         "risk_pct": 0.005,       # 0.5% risk per trade
         "max_risk_usd": 5.0,
         "equity_cap_mult": 2,    # cap compounding at 2x initial
-        "sl_range_mult": 0.50,   # proven SL distance for 1m candles
-        "tp_range_mult": 1.30,   # R:R = 2.6:1
-        "trail_pct": 0.40,       # wider trail — let winners run
-        "trail_activation_R": 0.6,  # only trail after 0.6R profit
+        "sl_range_mult": 0.80,   # wider SL: WR 44%→61%, +36% vs +3% at 0.50
+        "tp_range_mult": 2.00,   # wider TP: captures larger winners
+        "trail_pct": 0.30,       # tighter trail locks profit (was 0.40)
+        "trail_activation_R": 0.3,  # start trailing early (was 0.6)
         "cooldown_ms": 60_000,   # 1 minute between entries
         "max_hold": 15,          # 15 candle max hold
         "max_daily_R": 10,       # daily loss limit
@@ -42,10 +44,10 @@ PROFILES: Dict[str, Dict[str, Any]] = {
         "risk_pct": 0.015,       # 1.5% risk per trade
         "max_risk_usd": 20.0,
         "equity_cap_mult": 3,    # moderate compounding
-        "sl_range_mult": 0.50,   # proven SL distance
-        "tp_range_mult": 1.60,   # R:R = 3.2:1
-        "trail_pct": 0.38,       # wider trail (was 0.25)
-        "trail_activation_R": 0.5,  # only trail after 0.5R profit
+        "sl_range_mult": 0.80,   # wider SL: WR 49%→61%, reduced whipsaw
+        "tp_range_mult": 2.00,   # wider TP: +98% combo vs +146% current (more stable)
+        "trail_pct": 0.25,       # tighter trail (was 0.38) — locks more profit
+        "trail_activation_R": 0.3,  # start trailing early (was 0.5)
         "cooldown_ms": 45_000,   # 45s cooldown
         "max_hold": 12,
         "max_daily_R": 15,
@@ -62,15 +64,15 @@ PROFILES: Dict[str, Dict[str, Any]] = {
         "risk_pct": 0.025,       # 2.5% risk per trade
         "max_risk_usd": 40.0,
         "equity_cap_mult": 4,    # compound up to 4x
-        "sl_range_mult": 0.50,   # proven SL distance — 0.30-0.35 gets whipsawed on 1m candles
-        "tp_range_mult": 1.60,   # R:R = 3.2:1 — wider TP lets winners run
-        "trail_pct": 0.30,       # trail at 30% of range
-        "trail_activation_R": 0.3,  # start trailing after 0.3R — balanced
+        "sl_range_mult": 1.00,   # wide SL: WR 52%→70%, +3806% (combo3 winner)
+        "tp_range_mult": 2.50,   # wider TP: +3861% at 2.50 (combo5 winner)
+        "trail_pct": 0.20,       # tight trail: +3460% vs +1209% at 0.30 (single biggest lever)
+        "trail_activation_R": 0.3,  # start trailing after 0.3R
         "cooldown_ms": 30_000,   # 30s cooldown
         "max_hold": 12,
         "max_daily_R": 20,
         "max_positions": 3,
-        "C_enter": 0.55,
+        "C_enter": 0.58,         # slightly stricter: better PF (was 0.55)
         "C_exit": 0.30,
         "alpha": 4,
         "conf_scale": True,
@@ -82,10 +84,10 @@ PROFILES: Dict[str, Dict[str, Any]] = {
         "risk_pct": 0.035,       # 3.5% risk per trade
         "max_risk_usd": 75.0,
         "equity_cap_mult": 6,    # heavy compounding
-        "sl_range_mult": 0.50,   # proven SL — R:R = 4:1
-        "tp_range_mult": 2.00,   # widest TP
-        "trail_pct": 0.35,       # wider trail (was 0.20)
-        "trail_activation_R": 0.5,  # only trail after 0.5R profit
+        "sl_range_mult": 1.00,   # wide SL: +3446% PF 1.64 (best risk-adj for ultra)
+        "tp_range_mult": 2.50,   # wider TP: lets biggest winners run
+        "trail_pct": 0.20,       # tight trail: locks profit aggressively (was 0.35)
+        "trail_activation_R": 0.3,  # start trailing early (was 0.5)
         "cooldown_ms": 20_000,   # 20s cooldown
         "max_hold": 12,
         "max_daily_R": 30,
@@ -99,35 +101,27 @@ PROFILES: Dict[str, Dict[str, Any]] = {
         "min_signals": 3,        # wide entry
     },
 
-    # ── Starter $50 — Aggressive ROI + Low Variance ──────────────────
+    # ── Starter $50 — Fee-optimized for small accounts ────────────────
     #
-    # Optimized for small accounts ($50-100). Maximizes expected ROI while
-    # minimizing variance through:
+    # Based on combo4 pattern (PF 1.84, highest quality trades):
+    #   - Wider SL (0.80) reduces fee-to-risk ratio
+    #   - Tighter trail (0.25) locks profit quickly
+    #   - 4/13 signal agreement (quality filter, PF 1.84)
     #   - Single position (no correlated drawdowns)
-    #   - Tighter trailing (locks profits at 18% of range)
-    #   - Higher signal agreement (4/13 signals must align)
-    #   - Capped daily loss at 12% of equity
-    #   - Wide R:R of 3.6:1 (high reward per risk unit)
-    #   - Moderate compounding (3x cap prevents runaway sizing)
-    #
-    # Expected performance (backtest-adjusted for live friction):
-    #   - ROI: 200-600% over 30 days (vs 400-1600% raw backtest)
-    #   - Max daily swing: ±12% equity
-    #   - Typical trades/day: 3-8
     #
     "starter_50": {
         "risk_pct": 0.02,        # 2% risk = $1.00 per trade on $50
         "max_risk_usd": 1.50,    # hard cap — protects against sizing bugs
         "equity_cap_mult": 3,    # compound up to 3x initial (max $150 effective)
-        "sl_range_mult": 0.50,   # proven SL distance — never go tighter
-        "tp_range_mult": 1.80,   # R:R = 3.6:1 (wider than aggressive for variance)
-        "trail_pct": 0.40,       # wider trail (was 0.18) — let winners run
-        "trail_activation_R": 0.5,  # only trail after 0.5R profit
+        "sl_range_mult": 0.80,   # wider SL: reduces fee-to-risk ratio (was 0.50)
+        "tp_range_mult": 2.00,   # wider TP: larger winners compensate for fees
+        "trail_pct": 0.25,       # tighter trail (was 0.40) — locks profit
+        "trail_activation_R": 0.3,  # start trailing early (was 0.5)
         "cooldown_ms": 45_000,   # 45s cooldown — prevents overtrading
         "max_hold": 10,          # 10 candle max hold — reduces overnight risk
         "max_daily_R": 6,        # max $6 daily loss = 12% of equity
         "max_positions": 1,      # SINGLE position — no correlated losses
-        "C_enter": 0.56,         # slightly stricter entry than aggressive
+        "C_enter": 0.58,         # stricter entry for quality (was 0.56)
         "C_exit": 0.32,          # exit on confidence drop
         "alpha": 4,              # sigmoid steepness for confidence
         "conf_scale": True,      # scale up on high confidence (1.0-1.2x)

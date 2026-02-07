@@ -1,10 +1,26 @@
 [tool.poetry]
 name = "smallfish"
-version = "2.0.0"
+version = "1.0.3"
 description = "Open-source signal-fusion scalping engine — microstructure tools for the small fish."
 license = "Apache-2.0"
-authors = ["Smallfish Contributors"]
-package-mode = false
+authors = ["Azer LTIFI azseza@tutamail.org"]
+packages = [
+    { include = "core", from = "src" },
+    { include = "exec", from = "src" },
+    { include = "gateway", from = "src" },
+    { include = "marketdata", from = "src" },
+    { include = "monitor", from = "src" },
+    { include = "remote", from = "src" },
+    { include = "signals", from = "src" },
+    { include = "strategies", from = "src" },
+    { include = "smallfish_cli", from = "src" },
+    { include = "app.py", from = "src" },
+    { include = "backtest.py", from = "src" },
+]
+
+[tool.poetry.scripts]
+smallfish = "smallfish_cli.entry:main_live"
+smallfish-backtest = "smallfish_cli.entry:main_backtest"
 
 [tool.poetry.dependencies]
 python = "^3.10"
@@ -20,6 +36,10 @@ plotext = "^5.2"
 rich = "^13.0"
 candlestick-chart = "^3.1"
 psutil = "^5.9"
+dydx-v4-client = {version = "^1.0", optional = true}
+
+[tool.poetry.extras]
+dydx = ["dydx-v4-client"]
 
 [tool.poetry.dev-dependencies]
 pytest = "^7.4"

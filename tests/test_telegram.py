@@ -635,7 +635,7 @@ class TestStateExtensions:
 
     def test_withdrawal_history_field(self, config):
         s = RuntimeState(config)
-        assert s.withdrawal_history == []
+        assert len(s.withdrawal_history) == 0
 
 
 class TestBacktestCommand:
