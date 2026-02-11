@@ -38,6 +38,12 @@ _INTERVAL_MAP = {
     "30m": "Min30", "60m": "Hour1", "1h": "Hour1",
 }
 
+# Seconds per candle for pagination advancement
+_INTERVAL_SECS = {
+    "Min1": 60, "Min5": 300, "Min15": 900,
+    "Min30": 1800, "Hour1": 3600,
+}
+
 
 def _fmt(value: float) -> str:
     """Format a float: no scientific notation, no trailing zeros."""
@@ -130,10 +136,17 @@ class MexcREST(ExchangeREST):
 
         if method in ("POST", "PUT") and body:
             async with session.request(method, url, json=body, headers=headers) as resp:
+                http_status = resp.status
                 data = await resp.json(content_type=None)
         else:
             async with session.request(method, url, params=params, headers=headers) as resp:
+                http_status = resp.status
                 data = await resp.json(content_type=None)
+
+        # Check HTTP-level errors (auth failures, server errors, rate limits)
+        if http_status >= 400:
+            log.error("REST %s %s HTTP %d: %s", method, path, http_status, data)
+            return {"code": http_status, "msg": f"HTTP {http_status}", "data": data}
 
         if isinstance(data, dict) and data.get("code") not in (0, 200, None):
             log.error("REST %s %s failed: %s", method, path, data)
@@ -156,6 +169,14 @@ class MexcREST(ExchangeREST):
 
         result = data.get("data", "")
         order_id = str(result) if result else ""
+        if not order_id:
+            return OrderResponse(
+                success=False,
+                order_id="",
+                error_code=0,
+                error_msg="API returned code=0 but no order ID in data field",
+                raw=data,
+            )
         return OrderResponse(
             success=True,
             order_id=order_id,
@@ -399,6 +420,7 @@ class MexcREST(ExchangeREST):
         """
         mexc_sym = to_mexc(symbol)
         mexc_interval = _INTERVAL_MAP.get(interval, "Min5")
+        step_secs = _INTERVAL_SECS.get(mexc_interval, 300)  # seconds per candle
 
         all_klines: List[dict] = []
         cursor_start = start_ms // 1000  # MEXC uses seconds
@@ -440,7 +462,7 @@ class MexcREST(ExchangeREST):
             newest_ts = int(times[-1])
             if newest_ts <= cursor_start:
                 break
-            cursor_start = newest_ts + 60  # advance by 1 candle (seconds)
+            cursor_start = newest_ts + step_secs  # advance by 1 candle
             await asyncio.sleep(0.1)  # rate limit
 
         # Deduplicate and sort

@@ -4,17 +4,19 @@
 # ============================================================
 
 # --- Exchange ---
-# "bybit" or "binance" (USDT-M Futures)
-exchange: "bybit"
+# "mexc" (0% maker / 0.01% taker — only profitable fee tier)
+# See README "Golden Fish" section for why MEXC is the only viable exchange.
+exchange: "mexc"
 
 # --- Symbols ---
-# Static defaults — override with AUTO_SYMBOLS=N env var for dynamic selection
+# Golden Fish assets: cheap + volatile + low fee ratio.
+# NEVER trade BTC/ETH — fee-to-risk ratio is too high, will burn equity fast.
+# Override with AUTO_SYMBOLS=N env var for dynamic selection.
 symbols:
-  - "BTCUSDT"
-  - "ETHUSDT"
-  - "SOLUSDT"
-  - "XRPUSDT"
+  - "ADAUSDT"
   - "DOGEUSDT"
+  - "XRPUSDT"
+  - "SUIUSDT"
 
 # Tick sizes per symbol (auto-fetched when using scanner)
 tick_sizes:

@@ -72,6 +72,10 @@ class TelegramBot:
         self._last_alert: dict[str, float] = {}
         self._alert_cooldown_s = config.get("telegram", {}).get("alert_cooldown_s", 300)
 
+        # Session health tracking for auto-reconnect
+        self._consecutive_failures = 0
+        self._max_failures_before_reconnect = 5
+
     async def start(self) -> None:
         """Start the Telegram bot polling loop."""
         if not self.enabled:
@@ -103,20 +107,42 @@ class TelegramBot:
             await self._session.close()
 
     async def _poll_loop(self) -> None:
-        """Long-poll for Telegram updates."""
+        """Long-poll for Telegram updates with auto-reconnection."""
         while self._running:
             try:
                 updates = await self._get_updates()
-                for update in updates:
-                    await self._handle_update(update)
+                if updates is not None:
+                    self._consecutive_failures = 0
+                    for update in updates:
+                        await self._handle_update(update)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                log.debug("Telegram poll error: %s", e)
+                self._consecutive_failures += 1
+                log.info("Telegram poll error (#%d): %s",
+                         self._consecutive_failures, e)
+                if self._consecutive_failures >= self._max_failures_before_reconnect:
+                    log.warning("Telegram: %d consecutive failures — recreating session",
+                                self._consecutive_failures)
+                    await self._recreate_session()
+                    self._consecutive_failures = 0
                 await asyncio.sleep(5)
 
-    async def _get_updates(self) -> list:
-        """Fetch updates from Telegram API."""
+    async def _recreate_session(self) -> None:
+        """Close and recreate the aiohttp session (network recovery)."""
+        try:
+            if self._session and not self._session.closed:
+                await self._session.close()
+        except Exception:
+            pass
+        import aiohttp
+        self._session = aiohttp.ClientSession()
+        log.info("Telegram session recreated")
+
+    async def _get_updates(self) -> list | None:
+        """Fetch updates from Telegram API. Returns None on failure."""
+        if not self._session or self._session.closed:
+            return None
         url = f"https://api.telegram.org/bot{self.token}/getUpdates"
         params = {"offset": self._offset, "timeout": 10, "limit": 10}
         try:
@@ -128,7 +154,7 @@ class TelegramBot:
                 return updates
         except Exception:
             await asyncio.sleep(2)
-            return []
+            return None
 
     async def _handle_update(self, update: dict) -> None:
         """Route incoming message to command handler."""
@@ -876,8 +902,19 @@ class TelegramBot:
         await self.send_message(f"ALERT [{alert_type}]\n{message}")
 
     async def alert_kill_switch(self, reason: str) -> None:
-        """Alert when kill switch is triggered."""
-        await self.alert("kill_switch", f"Kill switch triggered: {reason}\nEquity: ${self.state.equity:.2f}")
+        """Alert when kill switch is triggered — NO COOLDOWN, always delivers."""
+        # Kill switch alerts bypass the generic cooldown.  You must always
+        # know when trading stops, especially on a headless RPi.
+        last_reason = self._last_alert.get("_kill_reason", "")
+        if reason == last_reason:
+            return  # same kill reason already sent, don't spam on every loop iter
+        self._last_alert["_kill_reason"] = reason
+        await self.send_message(
+            f"ALERT [KILL SWITCH]\n"
+            f"Kill switch triggered: {reason}\n"
+            f"Equity: ${self.state.equity:.2f}\n"
+            f"Send /resume to re-enable trading"
+        )
 
     async def alert_drawdown(self, dd_pct: float) -> None:
         """Alert on significant drawdown."""

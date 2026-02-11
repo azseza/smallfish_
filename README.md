@@ -575,17 +575,26 @@ smallfish --mode aggressive --dashboard --multigrid --telegram
 4. **Start conservative**: validate fills and slippage before scaling up
 5. **Respect the kill switch**: the market will always be there tomorrow
 
-### Expected Performance (MEXC fees, 30d, 5m, $50 start)
+### Expected Performance (MEXC fees, 7d, 5m, $45 start)
 
-| Profile | Return | Win Rate | Profit Factor | Trades |
-|---------|--------|----------|---------------|--------|
-| conservative | +97% | 65% | 1.59 | 1172 |
-| balanced | +621% | 66% | 1.46 | 2101 |
-| aggressive | +9361% | 71% | 1.74 | 5413 |
-| ultra | +14243% | 70% | 1.58 | 6578 |
+| Profile | Return | Final $ | Win Rate | Profit Factor | Max DD | Trades |
+|---------|--------|---------|----------|---------------|--------|--------|
+| conservative | +28.5% | $57.84 | 68.0% | 1.78 | 20.4% | 269 |
+| balanced | +76.3% | $79.32 | 67.0% | 1.37 | 46.7% | 412 |
+| **aggressive** | **+220.6%** | **$144.26** | **73.4%** | **1.61** | **69.3%** | **403** |
+| ultra | +22312% | $10085 | 72.0% | 4.76 | 95.6% | 1740 |
 
-> These are backtest results. Live performance will be lower due to slippage, partial fills,
-> and latency. Expect 30-50% of backtest returns in live trading.
+Reproduced with:
+```bash
+smallfish-backtest --symbols ADAUSDT DOGEUSDT XRPUSDT SUIUSDT --equity 45 --sweep --maker-fee 0.0 --taker-fee 0.0001 --exchange mexc --interval 5
+```
+
+> These are backtest results on ~7 days of MEXC 5m data (API returns max 2000 candles per symbol).
+> Live performance will be lower due to slippage, partial fills, and latency. Expect 30-50% of
+> backtest returns in live trading. With aggressive at 30-50% live efficiency: **$45 → $75-110 in a week**.
+>
+> **Fee gotcha**: `--taker-fee` is a decimal, not a percentage. MEXC 0.01% = `0.0001`. Using `0.01`
+> would mean 1% fee and everything goes negative. Double-check your decimals.
 
 ## License
 

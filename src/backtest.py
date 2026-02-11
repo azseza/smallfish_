@@ -1168,8 +1168,8 @@ if __name__ == "__main__":
                         help="Exchange to use for data download")
     parser.add_argument("--fees", action="store_true",
                         help="Enable realistic fee modeling (maker 0.02%%, taker 0.055%%)")
-    parser.add_argument("--interval", default="1", choices=["1", "3", "5", "15", "30", "60"],
-                        help="Candle interval in minutes (default: 1)")
+    parser.add_argument("--interval", default="5", choices=["1", "3", "5", "15", "30", "60"],
+                        help="Candle interval in minutes (default: 5 — golden fish sweet spot)")
     parser.add_argument("--maker-fee", type=float, default=None, metavar="PCT",
                         help="Override maker fee rate (e.g. 0.0002 for 0.02%%)")
     parser.add_argument("--taker-fee", type=float, default=None, metavar="PCT",

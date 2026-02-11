@@ -11,6 +11,7 @@ import asyncio
 import datetime
 import logging
 import os
+import signal
 import sys
 import time
 
@@ -83,7 +84,15 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _setup_signal_handlers() -> None:
+    """Install SIGTERM handler for clean systemd/Docker shutdown on RPi."""
+    def _sigterm_handler(signum, frame):
+        raise KeyboardInterrupt("SIGTERM received — shutting down cleanly")
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
+
 async def main() -> None:
+    _setup_signal_handlers()
     load_dotenv()
     args = parse_args()
     config = load_config()
@@ -230,6 +239,85 @@ async def main() -> None:
 
     except Exception as e:
         log.error("Startup error (equity may be wrong!): %s", e)
+
+    # --- Position recovery: detect orphaned positions from prior crash ---
+    try:
+        existing_positions = await rest.get_positions()
+        if existing_positions:
+            recovered = 0
+            for raw_pos in existing_positions:
+                # Normalize symbol from exchange format
+                raw_sym = raw_pos.get("symbol", "")
+                if hasattr(rest, '_from_exchange_symbol'):
+                    sym = rest._from_exchange_symbol(raw_sym)
+                else:
+                    from gateway.symbol_map import from_mexc, from_binance
+                    if exchange == "mexc":
+                        sym = from_mexc(raw_sym)
+                    elif exchange == "binance":
+                        sym = from_binance(raw_sym) if 'from_binance' in dir() else raw_sym
+                    else:
+                        sym = raw_sym
+
+                if sym not in symbols:
+                    continue
+
+                hold_vol = float(raw_pos.get("holdVol", raw_pos.get("positionAmt", 0)))
+                if hold_vol <= 0:
+                    continue
+
+                # Determine side
+                pos_type = raw_pos.get("positionType", 0)
+                if pos_type == 1:
+                    side = Side.BUY
+                elif pos_type == 2:
+                    side = Side.SELL
+                else:
+                    # Bybit/Binance format
+                    side_str = raw_pos.get("side", "")
+                    side = Side.BUY if side_str in ("Buy", "LONG") else Side.SELL
+
+                entry_price = float(raw_pos.get("openAvgPrice",
+                                   raw_pos.get("entryPrice", 0)))
+
+                if entry_price <= 0 or state.has_position(sym):
+                    continue
+
+                # Recover into state (no TP/SL — will be managed on next tick)
+                tick_size = config.get("tick_sizes", {}).get(sym, 0.01)
+                avg_range = tick_size * 5  # rough estimate
+                sl_mult = config.get("profile", {}).get("sl_range_mult", 0.80)
+                tp_mult = config.get("profile", {}).get("tp_range_mult", 2.00)
+                stop_dist = avg_range * sl_mult
+                if side == Side.BUY:
+                    stop_price = entry_price - stop_dist
+                    tp_price = entry_price + stop_dist * tp_mult / sl_mult
+                else:
+                    stop_price = entry_price + stop_dist
+                    tp_price = entry_price - stop_dist * tp_mult / sl_mult
+
+                state.on_enter(
+                    symbol=sym, side=side, fill_price=entry_price,
+                    quantity=hold_vol, confidence=0.5, scores={},
+                    stop_price=stop_price, tp_price=tp_price,
+                )
+                recovered += 1
+                log.warning("RECOVERED position: %s %s qty=%.4f entry=%.4f",
+                            side.name, sym, hold_vol, entry_price)
+
+            if recovered > 0:
+                log.warning("Recovered %d orphaned position(s) from exchange", recovered)
+                # Re-attach TP/SL brackets for recovered positions
+                for sym in list(state.positions.keys()):
+                    pos = state.position(sym)
+                    if pos:
+                        oco_ok = await oco.attach(pos)
+                        if oco_ok:
+                            log.info("Re-attached TP/SL for recovered %s", sym)
+                        else:
+                            log.warning("Failed to re-attach TP/SL for %s — will manage on next tick", sym)
+    except Exception as e:
+        log.warning("Position recovery check failed (non-fatal): %s", e)
 
     # Equity sync interval (re-fetch wallet balance periodically)
     _equity_sync_interval_s = config.get("equity_sync_interval_s", 30)

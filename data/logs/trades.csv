@@ -1,1 +1,2 @@
 timestamp,datetime,symbol,side,entry_price,exit_price,quantity,pnl,pnl_R,duration_ms,duration_s,slippage_entry,slippage_exit,exit_reason,mae,mfe
+1770474796936,2026-02-07 14:33:16,BTCUSDT,BUY,68944.2,0.0,0.007,-482.6094,-1930.4376,6948,6.95,,,position_closed,,

@@ -70,7 +70,7 @@ PROFILES: Dict[str, Dict[str, Any]] = {
         "trail_activation_R": 0.3,  # start trailing after 0.3R
         "cooldown_ms": 30_000,   # 30s cooldown
         "max_hold": 12,
-        "max_daily_R": 20,
+        "max_daily_R": 10,       # 10R = 25% max daily loss (tightened for small accounts)
         "max_positions": 3,
         "C_enter": 0.58,         # slightly stricter: better PF (was 0.55)
         "C_exit": 0.30,

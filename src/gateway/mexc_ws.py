@@ -2,9 +2,9 @@
 
 Handles both public (depth, deals) and private (orders, positions) streams.
 Key differences from Bybit/Binance:
-- URL: wss://contract.mexc.com/ws (single endpoint, JSON)
+- URL: wss://contract.mexc.com/edge (single endpoint, JSON)
 - Ping: send {"method": "ping"} every 15s
-- Depth: subscribe "sub.contract.depth.{symbol}"
+- Depth: subscribe "sub.contract.depth.{symbol}" — absolute quantities (full snapshot each push)
 - Trades: subscribe "sub.contract.deal.{symbol}"
 - Private: authenticate then subscribe sub.personal.*
 - Symbol format: BTC_USDT (underscore separator)
@@ -232,11 +232,10 @@ class MexcWS(ExchangeWS):
             "a": [[str(a[0]), str(a[1])] for a in asks] if asks else [],
         }
 
-        if symbol not in self._first_book:
-            evt_type = EventType.BOOK_SNAPSHOT
-            self._first_book[symbol] = True
-        else:
-            evt_type = EventType.BOOK_DELTA
+        # MEXC depth pushes are absolute quantities (full snapshot each time),
+        # not deltas.  Always treat as BOOK_SNAPSHOT so the OrderBook replaces
+        # its internal state instead of accumulating stale levels.
+        evt_type = EventType.BOOK_SNAPSHOT
 
         events.append(WsEvent(
             event_type=evt_type,
