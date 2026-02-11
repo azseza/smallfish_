@@ -818,7 +818,7 @@ async def main():
     parser.add_argument("--equity", type=float, default=50.0)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--top", type=int, default=20, help="Show top N results")
-    parser.add_argument("--exchange", default="bybit", choices=["bybit", "binance"])
+    parser.add_argument("--exchange", default="bybit", choices=["bybit", "binance", "mexc", "dydx"])
     args = parser.parse_args()
 
     symbols = args.symbols or [args.symbol]

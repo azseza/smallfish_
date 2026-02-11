@@ -13,10 +13,9 @@ exchange: "mexc"
 # NEVER trade BTC/ETH — fee-to-risk ratio is too high, will burn equity fast.
 # Override with AUTO_SYMBOLS=N env var for dynamic selection.
 symbols:
-  - "ADAUSDT"
-  - "DOGEUSDT"
-  - "XRPUSDT"
+  - "SOLUSDT"
   - "SUIUSDT"
+  - "XRPUSDT"
 
 # Tick sizes per symbol (auto-fetched when using scanner)
 tick_sizes:
@@ -56,7 +55,7 @@ qty_step:
 
 # --- Account ---
 leverage: 10
-initial_equity: 1000  # USD — updated at startup from REST
+initial_equity: 45  # USD — updated at startup from REST
 
 # --- Risk Management ---
 max_spread: 2                        # max bid-ask spread in ticks to allow entry

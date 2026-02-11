@@ -74,10 +74,24 @@ class OrderRouter:
                     # Try to amend the order to new price
                     result = await self.rest.amend_order(symbol, order_id, price=new_price)
                     if result.success:
-                        price = new_price
-                        reprice_count += 1
-                        log.info("Repriced order %s to %.2f (attempt %d)",
-                                 order_id, new_price, reprice_count)
+                        if result.order_id:
+                            # Native amend (Bybit/Binance) — same order, new price
+                            price = new_price
+                            reprice_count += 1
+                            log.info("Repriced order %s to %.2f (attempt %d)",
+                                     order_id, new_price, reprice_count)
+                        else:
+                            # Cancel+re-place (MEXC/dYdX) — old order gone, must re-place
+                            new_oid = await self._post_only_limit(symbol, side, qty, new_price)
+                            if new_oid:
+                                order_id = new_oid
+                                price = new_price
+                                reprice_count += 1
+                                log.info("Re-placed order %s at %.2f (attempt %d)",
+                                         new_oid, new_price, reprice_count)
+                            else:
+                                log.warning("Re-place after cancel failed — giving up")
+                                return None
                     else:
                         # Order might already be filled or cancelled
                         break
